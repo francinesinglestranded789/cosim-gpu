@@ -121,6 +121,21 @@ gem5 crashed or socket closed. Check gem5 docker logs for `fatal`, `panic`, or
 Check `dmesg | grep -i amdgpu` for initialization errors. Common cause: the driver
 was blacklisted but modprobe was never run (check `cosim-gpu-setup.service` status).
 
+### 6. cosim-gpu-setup.service exits 0 but driver not loaded
+
+**Symptom**: `systemctl status cosim-gpu-setup` shows SUCCESS, but `lsmod | grep amdgpu`
+is empty.
+
+**Cause**: `modprobe.blacklist=amdgpu` on the kernel command line creates a runtime
+blacklist file at `/run/modprobe.d/`. The `modprobe` command silently skips blacklisted
+modules (returns exit 0 without loading).
+
+**Fix**: The setup script must remove the runtime blacklist before calling modprobe:
+```bash
+rm -f /run/modprobe.d/*blacklist* 2>/dev/null
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
+```
+
 ## Debugging Tips
 
 - **Start QEMU with serial log capture**: Use `2>&1 | tee /tmp/qemu-serial.log` to
