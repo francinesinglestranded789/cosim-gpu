@@ -97,15 +97,16 @@ cp gem5/util/m5/build/x86/out/m5 gem5-resources/src/x86-ubuntu-gpu-ml/files/
 ./scripts/cosim_launch.sh
 ```
 
-Guest 启动后（自动以 root 登录）：
+Guest 启动后（自动以 root 登录），GPU 驱动通过 `cosim-gpu-setup.service`
+自动加载（约 40 秒）。验证：
 
 ```bash
-# 加载 GPU 驱动
-modprobe amdgpu ip_block_mask=0x67 discovery=2
-
-# 验证
 rocm-smi          # 应显示设备 0x74a0
-rocminfo          # 应显示 gfx942, 320 CUs
+rocminfo          # 应显示 gfx942
+
+# 手动加载（如果 systemd 服务未安装）：
+dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 
 # 运行 HIP 测试
 cat > /tmp/test.cpp << 'EOF'

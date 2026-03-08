@@ -241,7 +241,7 @@ docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
     -nographic -no-reboot
 ```
 
-> **重要：** 内核命令行中必须包含 `modprobe.blacklist=amdgpu`，阻止驱动自动加载，以便手动控制加载时机和参数。
+> **重要：** 内核命令行必须包含 `modprobe.blacklist=amdgpu`，防止 PCI 子系统在 VGA ROM 写入共享内存之前自动加载驱动。`cosim-gpu-setup.service` 会按正确顺序初始化（dd ROM → modprobe）。
 
 或者以后台 screen 模式运行：
 
@@ -269,26 +269,35 @@ screen -r qemu-cosim
 
 Guest Linux 启动完成后（自动以 root 登录），执行以下命令加载 amdgpu 驱动。
 
-### 方式一：自动加载（磁盘镜像已配置 systemd 服务）
+### 方式一：自动加载（默认）
 
-如果磁盘镜像中已配置 `load-amdgpu.service`（systemd 服务），驱动会在开机时自动加载，跳过此步骤。
+磁盘镜像内置 `cosim-gpu-setup.service`，开机时自动执行：
+
+1. 通过 `dd` 写入 VGA ROM 到 `0xC0000`（gem5 `readROM()` 需要此数据）
+2. 链接 IP discovery 固件
+3. 执行 `modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0`
+
+服务约 40 秒完成。登录后用 `rocm-smi` 验证。
 
 ### 方式二：手动加载
 
 ```bash
-# 1. 链接 IP discovery 固件
+# 1. 加载 VGA ROM（modprobe 之前必须执行）
+dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
+
+# 2. 链接 IP discovery 固件
 ln -sf /usr/lib/firmware/amdgpu/mi300_discovery \
        /usr/lib/firmware/amdgpu/ip_discovery.bin
 
-# 2. 加载 amdgpu 驱动
-#    ip_block_mask=0x67 : 禁用 PSP（位3）和 SMU（位4），cosim 不模拟这些 IP 块
-#    discovery=2        : 使用 IP discovery 固件（不依赖 VBIOS）
-modprobe amdgpu ip_block_mask=0x67 discovery=2
+# 3. 加载 amdgpu 驱动
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 ```
 
 > **关键参数说明：**
 > - `ip_block_mask=0x67`（二进制 0110_0111）启用 GMC、IH、DCN、GFX、SDMA、VCN，禁用 PSP 和 SMU
 > - 若使用错误的 mask（如 0x6f），PSP 初始化会触发 GPU reset 导致内核 panic
+> - `ras_enable=0` 防止 `amdgpu_atom_parse_data_header` 中的空指针崩溃（cosim ROM 仅 3KB，ATOMBIOS 数据最小化）
+> - `dd` 步骤**必须**在 modprobe 之前执行 — 否则驱动的 BIOS 发现链全部失败，`atom_context` 为 NULL
 
 ### 验证驱动加载
 

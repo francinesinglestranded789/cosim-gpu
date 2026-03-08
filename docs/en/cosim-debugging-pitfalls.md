@@ -58,7 +58,36 @@ MI300X discovery order (from dmesg):
 
 ---
 
-## 3. PM4ReleaseMem.dataSelect Panic
+## 3. NULL Deref in amdgpu_atom_parse_data_header (Missing VGA ROM)
+
+**Symptom**: `modprobe amdgpu` causes kernel NULL pointer dereference at `amdgpu_atom_parse_data_header+0x1b`. Call chain: `amdgpu_ras_init → amdgpu_atomfirmware_mem_ecc_supported → amdgpu_atom_parse_data_header`. RAX=0 (NULL `atom_context`).
+
+**Root Cause**: The amdgpu driver's BIOS discovery chain has 5 methods, all of which fail in cosim mode:
+
+| Method | Why it fails |
+|--------|-------------|
+| `amdgpu_atrm_get_bios()` | No ACPI ATRM method in QEMU Q35 |
+| `amdgpu_acpi_vfct_bios()` | No ACPI VFCT table |
+| `amdgpu_read_bios_from_rom()` | Reads via SMU registers, but SMU is disabled by `ip_block_mask=0x67` |
+| `amdgpu_read_platform_bios()` | No platform-provided ROM |
+| `amdgpu_read_disabled_bios()` | Not functional in cosim |
+
+The driver logs `"Unable to locate a BIOS ROM"` and `"VBIOS image optional, proceeding"`, but the RAS init path unconditionally calls `amdgpu_atom_parse_data_header()` without checking for NULL `atom_context`.
+
+**Fix**: Write the VGA ROM to physical address `0xC0000` (shared memory) **before** `modprobe`:
+
+```bash
+dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
+```
+
+The ROM data at `0xC0000` is accessible by gem5 via `/dev/shm/cosim-guest-ram`. When the driver reads the ROM via SMU MMIO registers, gem5's `AMDGPUDevice::readROM()` reads from `system->getPhysMem()` at `VGA_ROM_DEFAULT + offset` and returns the ROM content through the cosim socket.
+
+**Pitfall**: QEMU's `romfile=` property loads the ROM into the PCI expansion ROM BAR, but the amdgpu driver does **not** read from the PCI ROM BAR directly — it uses SMU register-based ROM access. The `romfile` alone is insufficient; the `dd` step is always required.
+
+---
+
+## 5. PM4ReleaseMem.dataSelect Panic
 
 **Symptom**: gem5 panics with `Unimplemented PM4ReleaseMem.dataSelect`.
 
@@ -76,7 +105,7 @@ MI300X discovery order (from dmesg):
 
 ---
 
-## 4. GART Table Not Populated in Co-simulation Mode
+## 6. GART Table Not Populated in Co-simulation Mode
 
 **Symptom**: Massive `GART translation for X not found` warnings. PM4 processor reads all-zero memory (opcode 0x0). KIQ ring test times out.
 

@@ -207,13 +207,13 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
   - QEMU event thread -> `msix_notify()` -> guest IH handler
 - **GART translation**: co-simulation fallback reads PTEs from shared VRAM; unmapped pages safely routed to sink
 - **65,000+ MMIO operations** handled without crashes
-- **Disk image**: `ip_block_mask=0x67` persisted via systemd service (`load-amdgpu.service` -> `/root/load_amdgpu.sh`)
+- **Disk image**: `cosim-gpu-setup.service` auto-loads driver at boot (dd ROM → modprobe with `ip_block_mask=0x67 discovery=2 ras_enable=0`)
 
 ### Known Limitations
 
 1. **Fence fallback timer**: 80+ DRM fence timeouts during driver initialization (~500 ms each). Ring tests "pass" via the DRM fallback timer. After driver loading completes, MSI interrupts work normally for compute dispatch.
 
-2. **No VGA BIOS ROM**: `Unable to locate a BIOS ROM` warning. Not needed for compute workloads; the VGA ROM dd step can be skipped.
+2. **VGA BIOS ROM must be dd'd first**: The `dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128` step is mandatory before `modprobe`. The driver's BIOS discovery chain (ACPI ATRM/VFCT, SMU ROM read, platform ROM) all fail in cosim mode. Without the ROM at `0xC0000`, `atom_context` is NULL and `amdgpu_ras_init` crashes with a NULL pointer dereference.
 
 3. **GART unmapped pages**: Some GART pages have PTE=0 and are routed to sink. This is safe but means DMA reads to those addresses return zeros.
 
@@ -255,13 +255,12 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
 
 ### Quick Start
 ```bash
-cd cosim/gem5
-bash scripts/cosim_launch.sh
-# After guest boots (auto-login as root):
-ln -sf /usr/lib/firmware/amdgpu/mi300_discovery \
-       /usr/lib/firmware/amdgpu/ip_discovery.bin
-modprobe amdgpu ip_block_mask=0x67 discovery=2
-rocm-smi   # verify GPU is visible
+cd cosim
+./scripts/cosim_launch.sh
+# GPU driver loads automatically via cosim-gpu-setup.service (~40s)
+# After guest boots, verify:
+rocm-smi   # should show device 0x74a0
+rocminfo   # should show gfx942
 ```
 
 ### Manual Launch (for Debugging)
@@ -298,8 +297,9 @@ screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
           shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184 \
   -nographic -no-reboot
 
-# 4. Interactive operations
-screen -S qemu-cosim -X stuff 'modprobe amdgpu ip_block_mask=0x67 discovery=2\n'
+# 4. Manual GPU setup (if cosim-gpu-setup.service is not installed)
+screen -S qemu-cosim -X stuff 'dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128\n'
+screen -S qemu-cosim -X stuff 'modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0\n'
 ```
 
 ## 6. Debugging Tips

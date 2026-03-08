@@ -4,30 +4,61 @@
 
 ## 概述
 
-QEMU 启动客户机 Linux 并获取 root shell 后，需要在运行任何 GPU 工作负载之前手动初始化 MI300X GPU。共有 **3 个步骤**，必须以 root 身份**按顺序**执行。
+MI300X GPU 驱动可在 QEMU 客户机启动后**自动**或**手动**加载。磁盘镜像中已包含 systemd 服务（`cosim-gpu-setup.service`），会在开机时自动完成完整的初始化流程。
 
-磁盘镜像中已包含所有必需的文件（ROM、固件、内核模块）——只需运行以下命令即可。
+磁盘镜像中已包含所有必需的文件（ROM、固件、内核模块）。
 
-## 前置条件
+## 自动加载（默认）
+
+磁盘镜像内置 `cosim-gpu-setup.service`，开机时自动执行：
+
+1. `dd` 写入 VGA ROM 到 `0xC0000`（gem5 通过共享内存的 `readROM()` 需要此数据）
+2. 链接 IP discovery 固件
+3. `modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0`
+
+服务约 40 秒完成。登录后 GPU 即可使用：
+
+```bash
+rocm-smi          # 应显示设备 0x74a0
+rocminfo          # 应显示 gfx942
+```
+
+服务文件内容：
+
+```ini
+# /etc/systemd/system/cosim-gpu-setup.service
+[Unit]
+Description=MI300X GPU Setup for Co-simulation
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cosim-gpu-setup.sh
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> **注意：** 内核命令行必须保留 `modprobe.blacklist=amdgpu`，防止 PCI 子系统在 ROM 写入共享内存之前自动加载驱动。systemd 服务会在 `dd` 之后显式 `modprobe`。
+
+## 手动加载
+
+如果 systemd 服务未安装，在 guest 启动后手动执行以下命令。
+
+### 前置条件
 
 - `cosim_launch.sh` 正在运行（gem5 + QEMU 已连接）
 - 客户机已启动并获取了 root shell
 - 内核命令行中传递了 `modprobe.blacklist=amdgpu`
-  （启动脚本会自动执行此操作）
 
-## 快速参考（可直接复制粘贴）
+### 快速参考（可直接复制粘贴）
 
 ```bash
-# All 3 steps in one go:
 dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
 ln -sf /usr/lib/firmware/amdgpu/mi300_discovery /usr/lib/firmware/amdgpu/ip_discovery.bin
-bash /home/gem5/load_amdgpu.sh
-```
-
-或使用自动化脚本（已在 gem5 仓库中）：
-
-```bash
-bash /path/to/gem5/scripts/cosim_guest_setup.sh
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 ```
 
 ## 详细步骤
@@ -67,49 +98,22 @@ ln -sf /usr/lib/firmware/amdgpu/mi300_discovery \
 ### 步骤 3：加载 amdgpu 内核模块
 
 ```bash
-bash /home/gem5/load_amdgpu.sh
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 ```
 
-**功能说明**：通过 `insmod` 手动加载 amdgpu 驱动及其所有依赖项（绕过 `modprobe`）。
-
-**为何不使用 `modprobe`**：QEMU+KVM 环境相比真实系统具有有限的 ACPI 支持。由于某些 ACPI 方法缺失，WMI 子系统初始化在 `modprobe` 期间会失败。解决方法是：
-
-1. 加载提供缺失 ACPI 符号的桩模块 `gem5_wmi.ko`
-2. 按顺序手动 `insmod` 每个依赖项
-3. 使用特定参数加载 `amdgpu.ko.zst`
+**功能说明**：使用协同仿真参数加载 amdgpu 驱动。
 
 **amdgpu 模块参数**：
 
 | 参数 | 值 | 含义 |
 |-----------|-------|---------|
-| `ip_block_mask` | `0x6f` | 仅启用受支持的 IP 块 |
-| `ppfeaturemask` | `0` | 禁用电源管理功能 |
-| `dpm` | `0` | 禁用动态电源管理 |
-| `audio` | `0` | 禁用音频（HDMI/DP） |
-| `ras_enable` | `0` | 禁用 RAS（可靠性）功能 |
+| `ip_block_mask` | `0x67` | 禁用 PSP（bit 3）和 SMU（bit 4）；cosim 不模拟这些 IP 块 |
+| `ras_enable` | `0` | 禁用 RAS — 防止 VBIOS 最小化时 `atom_context` 为 NULL 导致的空指针崩溃 |
 | `discovery` | `2` | 使用固件文件进行 IP discovery |
 
-**完整 insmod 序列**（供参考）：
+> **警告**：使用 `ip_block_mask=0x6f`（仅禁用 SMU）会导致 PSP 固件加载失败和内核 panic。务必使用 `0x67`。
 
-```bash
-insmod /home/gem5/gem5_wmi.ko
-insmod /lib/modules/$(uname -r)/kernel/drivers/acpi/video.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/i2c/algos/i2c-algo-bit.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/media/rc/rc-core.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/media/cec/core/cec.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/gpu/drm/display/drm_display_helper.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/gpu/drm/drm_suballoc_helper.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/gpu/drm/drm_exec.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amdkcl.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amd-sched.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amdxcp.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amddrm_buddy.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amddrm_exec.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amdttm.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amddrm_ttm_helper.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amdgpu.ko.zst \
-    ip_block_mask=0x6f ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
-```
+> **警告**：`dd` 步骤（步骤 1）在 `modprobe` 之前**必须**执行。否则驱动的 BIOS 发现链全部失败（ACPI 不可用、SMU 已禁用），导致 `"Unable to locate a BIOS ROM"` 后在 `amdgpu_ras_init` → `amdgpu_atom_parse_data_header` 处发生空指针崩溃。
 
 ## 验证
 
@@ -133,8 +137,9 @@ rocminfo | head -40
 
 | 症状 | 原因 | 解决方法 |
 |---------|-------|-----|
-| `Unable to locate a BIOS ROM` | 步骤 1 未执行，或 mi300.rom 缺失 | 运行 dd 命令；检查 `/root/roms/mi300.rom` 是否存在 |
+| `Unable to locate a BIOS ROM` + 空指针崩溃 | 步骤 1（dd ROM）未在 modprobe 之前执行 | 先执行 `dd`；检查 `/root/roms/mi300.rom` 是否存在 |
 | `insmod: ERROR: could not load module` | 内核版本不匹配 | 使用匹配的内核重建磁盘镜像 |
+| `cosim-gpu-setup.service` 失败 | 检查 `journalctl -u cosim-gpu-setup` | 确认磁盘镜像中 ROM 文件和模块存在 |
 | MMIO 读取全部返回零 | gem5 未连接或已崩溃 | 检查 `docker logs gem5-cosim` |
 | `probe failed with error -12` | BAR 布局不匹配 | 使用正确的 BAR5=MMIO 布局重建 QEMU |
 | gem5 因 `schedule()` 断言崩溃 | 定时器事件溢出 | 确保设置了 `disable_rtc_events` 和 `disable_timer_events` |
@@ -145,6 +150,6 @@ rocminfo | head -40
 |------|------|--------|
 | VGA BIOS ROM | `/root/roms/mi300.rom` | 由 Packer 构建 |
 | IP Discovery 固件 | `/usr/lib/firmware/amdgpu/mi300_discovery` | 由 Packer 构建 |
-| WMI 桩模块 | `/home/gem5/gem5_wmi.ko` | 由 Packer 构建 |
-| 驱动加载脚本 | `/home/gem5/load_amdgpu.sh` | `gem5-resources/src/x86-ubuntu-gpu-ml/files/` |
+| 自动加载服务 | `/etc/systemd/system/cosim-gpu-setup.service` | 通过 `guestmount` 安装 |
+| 自动加载脚本 | `/usr/local/bin/cosim-gpu-setup.sh` | 通过 `guestmount` 安装 |
 | amdgpu 模块 | `/lib/modules/$(uname -r)/updates/dkms/amdgpu.ko.zst` | ROCm 7.0 DKMS |

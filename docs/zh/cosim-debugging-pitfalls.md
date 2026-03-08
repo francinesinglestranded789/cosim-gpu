@@ -58,7 +58,36 @@ MI300X 检测顺序（来自 dmesg）：
 
 ---
 
-## 3. PM4ReleaseMem.dataSelect panic
+## 3. amdgpu_atom_parse_data_header 空指针崩溃（缺少 VGA ROM）
+
+**现象**：`modprobe amdgpu` 导致内核空指针崩溃，位于 `amdgpu_atom_parse_data_header+0x1b`。调用链：`amdgpu_ras_init → amdgpu_atomfirmware_mem_ecc_supported → amdgpu_atom_parse_data_header`。RAX=0（NULL `atom_context`）。
+
+**根因**：amdgpu 驱动的 BIOS 发现链有 5 种方法，在 cosim 模式下全部失败：
+
+| 方法 | 失败原因 |
+|------|---------|
+| `amdgpu_atrm_get_bios()` | QEMU Q35 无 ACPI ATRM 方法 |
+| `amdgpu_acpi_vfct_bios()` | 无 ACPI VFCT 表 |
+| `amdgpu_read_bios_from_rom()` | 通过 SMU 寄存器读取，但 SMU 被 `ip_block_mask=0x67` 禁用 |
+| `amdgpu_read_platform_bios()` | 无平台提供的 ROM |
+| `amdgpu_read_disabled_bios()` | cosim 下不可用 |
+
+驱动打印 `"Unable to locate a BIOS ROM"` 和 `"VBIOS image optional, proceeding"`，但 RAS 初始化路径无条件调用 `amdgpu_atom_parse_data_header()` 而不检查 NULL `atom_context`。
+
+**修复**：在 `modprobe` **之前**将 VGA ROM 写入物理地址 `0xC0000`（共享内存）：
+
+```bash
+dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
+```
+
+`0xC0000` 处的 ROM 数据通过 `/dev/shm/cosim-guest-ram` 可被 gem5 访问。当驱动通过 SMU MMIO 寄存器读取 ROM 时，gem5 的 `AMDGPUDevice::readROM()` 从 `system->getPhysMem()` 的 `VGA_ROM_DEFAULT + offset` 处读取，通过 cosim socket 返回 ROM 内容。
+
+**陷阱**：QEMU 的 `romfile=` 属性将 ROM 加载到 PCI expansion ROM BAR，但 amdgpu 驱动**不会**直接从 PCI ROM BAR 读取——而是通过 SMU 寄存器访问 ROM。仅靠 `romfile` 不够；`dd` 步骤始终必要。
+
+---
+
+## 5. PM4ReleaseMem.dataSelect panic
 
 **现象**：gem5 panic，报错 `Unimplemented PM4ReleaseMem.dataSelect`。
 
@@ -76,7 +105,7 @@ MI300X 检测顺序（来自 dmesg）：
 
 ---
 
-## 4. 协同仿真模式下 GART 表未填充
+## 6. 协同仿真模式下 GART 表未填充
 
 **现象**：大量 `GART translation for X not found` 警告。PM4 处理器读到全零内存（opcode 0x0）。KIQ ring test 超时。
 

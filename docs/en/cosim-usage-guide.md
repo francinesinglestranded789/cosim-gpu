@@ -241,7 +241,7 @@ docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
     -nographic -no-reboot
 ```
 
-> **Important:** The kernel command line must include `modprobe.blacklist=amdgpu` to prevent the driver from loading automatically, allowing manual control of the loading timing and parameters.
+> **Important:** The kernel command line must include `modprobe.blacklist=amdgpu` to prevent the PCI subsystem from auto-loading the driver before the VGA ROM is written to shared memory. The `cosim-gpu-setup.service` handles the correct initialization order (dd ROM → modprobe).
 
 Or run in background screen mode:
 
@@ -269,26 +269,35 @@ screen -r qemu-cosim
 
 After the guest Linux finishes booting (auto-login as root), run the following commands to load the amdgpu driver.
 
-### Option 1: Automatic Loading (Disk Image Pre-configured with systemd Service)
+### Option 1: Automatic Loading (Default)
 
-If the disk image has `load-amdgpu.service` (systemd service) configured, the driver will be loaded automatically at boot. Skip this step.
+The disk image includes `cosim-gpu-setup.service` which runs at boot:
+
+1. Writes VGA ROM to `0xC0000` via `dd` (required for gem5 `readROM()`)
+2. Symlinks IP discovery firmware
+3. Runs `modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0`
+
+The service completes in ~40 seconds. After login, verify with `rocm-smi`.
 
 ### Option 2: Manual Loading
 
 ```bash
-# 1. Symlink the IP discovery firmware
+# 1. Load VGA ROM (REQUIRED before modprobe)
+dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
+
+# 2. Symlink the IP discovery firmware
 ln -sf /usr/lib/firmware/amdgpu/mi300_discovery \
        /usr/lib/firmware/amdgpu/ip_discovery.bin
 
-# 2. Load the amdgpu driver
-#    ip_block_mask=0x67 : disable PSP (bit 3) and SMU (bit 4), cosim does not model these IP blocks
-#    discovery=2        : use IP discovery firmware (not dependent on VBIOS)
-modprobe amdgpu ip_block_mask=0x67 discovery=2
+# 3. Load the amdgpu driver
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 ```
 
 > **Key parameter notes:**
 > - `ip_block_mask=0x67` (binary 0110_0111) enables GMC, IH, DCN, GFX, SDMA, VCN, and disables PSP and SMU
 > - Using an incorrect mask (e.g., 0x6f) will cause PSP initialization to trigger a GPU reset, resulting in a kernel panic
+> - `ras_enable=0` is required to prevent a NULL pointer crash in `amdgpu_atom_parse_data_header` (the 3KB cosim ROM has minimal ATOMBIOS data)
+> - The `dd` step is **mandatory** — without it, the driver's BIOS discovery chain fails and `atom_context` is NULL
 
 ### Verify Driver Loading
 

@@ -4,30 +4,61 @@
 
 ## Overview
 
-After QEMU boots the guest Linux and you obtain a root shell, you need to manually initialize the MI300X GPU before running any GPU workloads. There are **3 steps**, which must be executed **in order** as root.
+The MI300X GPU driver can be loaded **automatically** or **manually** after the QEMU guest boots. The disk image includes a systemd service (`cosim-gpu-setup.service`) that handles the full initialization sequence at boot time.
 
-All required files (ROM, firmware, kernel modules) are already included in the disk image -- just run the commands below.
+All required files (ROM, firmware, kernel modules) are already included in the disk image.
 
-## Prerequisites
+## Automatic Loading (Default)
+
+The disk image ships with `cosim-gpu-setup.service`, which runs at boot and performs:
+
+1. `dd` the VGA ROM to `0xC0000` (required for gem5's `readROM()` via shared memory)
+2. Symlink IP discovery firmware
+3. `modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0`
+
+The service completes in ~40 seconds. After guest login, GPU is ready:
+
+```bash
+rocm-smi          # should show device 0x74a0
+rocminfo          # should show gfx942
+```
+
+The service file:
+
+```ini
+# /etc/systemd/system/cosim-gpu-setup.service
+[Unit]
+Description=MI300X GPU Setup for Co-simulation
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cosim-gpu-setup.sh
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> **Note:** `modprobe.blacklist=amdgpu` must remain in the kernel command line to prevent the PCI subsystem from auto-loading the driver before the ROM is written to shared memory. The systemd service handles the explicit `modprobe` after `dd`.
+
+## Manual Loading
+
+If the systemd service is not installed, run these commands manually after guest boot.
+
+### Prerequisites
 
 - `cosim_launch.sh` is running (gem5 + QEMU are connected)
 - The guest has booted and you have a root shell
 - `modprobe.blacklist=amdgpu` was passed on the kernel command line
-  (the launch script does this automatically)
 
-## Quick Reference (Copy-Paste Ready)
+### Quick Reference (Copy-Paste Ready)
 
 ```bash
-# All 3 steps in one go:
 dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
 ln -sf /usr/lib/firmware/amdgpu/mi300_discovery /usr/lib/firmware/amdgpu/ip_discovery.bin
-bash /home/gem5/load_amdgpu.sh
-```
-
-Or use the automation script (included in the gem5 repo):
-
-```bash
-bash /path/to/gem5/scripts/cosim_guest_setup.sh
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 ```
 
 ## Detailed Steps
@@ -67,49 +98,22 @@ ln -sf /usr/lib/firmware/amdgpu/mi300_discovery \
 ### Step 3: Load the amdgpu Kernel Module
 
 ```bash
-bash /home/gem5/load_amdgpu.sh
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 ```
 
-**What it does**: Manually loads the amdgpu driver and all its dependencies via `insmod` (bypassing `modprobe`).
-
-**Why not use `modprobe`**: The QEMU+KVM environment has limited ACPI support compared to real hardware. Because certain ACPI methods are missing, WMI subsystem initialization fails during `modprobe`. The workaround is:
-
-1. Load the stub module `gem5_wmi.ko`, which provides the missing ACPI symbols
-2. Manually `insmod` each dependency in order
-3. Load `amdgpu.ko.zst` with specific parameters
+**What it does**: Loads the amdgpu driver with co-simulation parameters.
 
 **amdgpu module parameters**:
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `ip_block_mask` | `0x6f` | Enable only supported IP blocks |
-| `ppfeaturemask` | `0` | Disable power management features |
-| `dpm` | `0` | Disable dynamic power management |
-| `audio` | `0` | Disable audio (HDMI/DP) |
-| `ras_enable` | `0` | Disable RAS (reliability) features |
+| `ip_block_mask` | `0x67` | Disable PSP (bit 3) and SMU (bit 4); cosim does not model these |
+| `ras_enable` | `0` | Disable RAS — prevents NULL deref on `atom_context` when VBIOS is minimal |
 | `discovery` | `2` | Use firmware file for IP discovery |
 
-**Full insmod sequence** (for reference):
+> **Warning**: Using `ip_block_mask=0x6f` (only disables SMU) will cause PSP firmware load failure and kernel panic. Always use `0x67`.
 
-```bash
-insmod /home/gem5/gem5_wmi.ko
-insmod /lib/modules/$(uname -r)/kernel/drivers/acpi/video.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/i2c/algos/i2c-algo-bit.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/media/rc/rc-core.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/media/cec/core/cec.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/gpu/drm/display/drm_display_helper.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/gpu/drm/drm_suballoc_helper.ko.zst
-insmod /lib/modules/$(uname -r)/kernel/drivers/gpu/drm/drm_exec.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amdkcl.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amd-sched.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amdxcp.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amddrm_buddy.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amddrm_exec.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amdttm.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amddrm_ttm_helper.ko.zst
-insmod /lib/modules/$(uname -r)/updates/dkms/amdgpu.ko.zst \
-    ip_block_mask=0x6f ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
-```
+> **Warning**: The `dd` step (Step 1) is **mandatory** before `modprobe`. Without it, the driver's BIOS discovery chain fails (ACPI unavailable, SMU disabled), resulting in `"Unable to locate a BIOS ROM"` followed by a NULL pointer crash in `amdgpu_ras_init` → `amdgpu_atom_parse_data_header`.
 
 ## Verification
 
@@ -133,8 +137,9 @@ rocminfo | head -40
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Unable to locate a BIOS ROM` | Step 1 was not executed, or mi300.rom is missing | Run the dd command; check that `/root/roms/mi300.rom` exists |
+| `Unable to locate a BIOS ROM` + NULL deref crash | Step 1 (dd ROM) was not executed before modprobe | Run `dd` first; check `/root/roms/mi300.rom` exists |
 | `insmod: ERROR: could not load module` | Kernel version mismatch | Rebuild the disk image with a matching kernel |
+| `cosim-gpu-setup.service` failed | Check `journalctl -u cosim-gpu-setup` | Verify ROM file and module exist in disk image |
 | MMIO reads all return zero | gem5 is not connected or has crashed | Check `docker logs gem5-cosim` |
 | `probe failed with error -12` | BAR layout mismatch | Rebuild QEMU with the correct BAR5=MMIO layout |
 | gem5 crashes with `schedule()` assertion | Timer event overflow | Ensure `disable_rtc_events` and `disable_timer_events` are set |
@@ -145,6 +150,6 @@ rocminfo | head -40
 |------|------|--------|
 | VGA BIOS ROM | `/root/roms/mi300.rom` | Built by Packer |
 | IP Discovery firmware | `/usr/lib/firmware/amdgpu/mi300_discovery` | Built by Packer |
-| WMI stub module | `/home/gem5/gem5_wmi.ko` | Built by Packer |
-| Driver loading script | `/home/gem5/load_amdgpu.sh` | `gem5-resources/src/x86-ubuntu-gpu-ml/files/` |
+| Auto-load service | `/etc/systemd/system/cosim-gpu-setup.service` | Installed via `guestmount` |
+| Auto-load script | `/usr/local/bin/cosim-gpu-setup.sh` | Installed via `guestmount` |
 | amdgpu module | `/lib/modules/$(uname -r)/updates/dkms/amdgpu.ko.zst` | ROCm 7.0 DKMS |

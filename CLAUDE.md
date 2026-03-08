@@ -29,7 +29,8 @@ Use `-j1` for gem5 linking if OOM-killed.
 ./scripts/cosim_launch.sh --gem5-debug MI300XCosim # with debug trace
 ```
 
-After guest boots: `modprobe amdgpu ip_block_mask=0x67 discovery=2`
+After guest boots: driver auto-loads via `cosim-gpu-setup.service` (dd ROM + modprobe).
+Manual: `dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128 && modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0`
 
 ## Architecture
 
@@ -52,6 +53,7 @@ python3 scripts/cosim_test_client.py /tmp/gem5-mi300x.sock  # socket test
 | Symptom | Fix |
 |---------|-----|
 | gem5 container exited | `docker logs gem5-cosim` (config error or OOM) |
+| NULL deref in `amdgpu_atom_parse_data_header` | Must `dd` ROM to 0xC0000 before modprobe |
 | KIQ disable timeout (-110) | Expected in cosim; harmless |
 | DRM client -13 / EPERM | Rebuild disk image with latest gem5-resources |
 

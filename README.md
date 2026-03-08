@@ -98,15 +98,16 @@ cp gem5/util/m5/build/x86/out/m5 gem5-resources/src/x86-ubuntu-gpu-ml/files/
 ./scripts/cosim_launch.sh
 ```
 
-After guest boots (auto-login as root):
+After guest boots (auto-login as root), the GPU driver loads automatically
+via `cosim-gpu-setup.service` (~40s). Verify:
 
 ```bash
-# Load GPU driver
-modprobe amdgpu ip_block_mask=0x67 discovery=2
-
-# Verify
 rocm-smi          # should show device 0x74a0
-rocminfo          # should show gfx942, 320 CUs
+rocminfo          # should show gfx942
+
+# Manual setup (if the systemd service is not installed):
+dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
+modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 
 # Run a HIP test
 cat > /tmp/test.cpp << 'EOF'

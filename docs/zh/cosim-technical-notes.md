@@ -207,13 +207,13 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
   - QEMU event 线程 → `msix_notify()` → guest IH 处理程序
 - **GART 翻译**：协同仿真兜底机制从共享 VRAM 读取 PTE；未映射页安全路由到 sink
 - **65,000+ 次 MMIO 操作**处理无崩溃
-- **磁盘镜像**：`ip_block_mask=0x67` 通过 systemd 服务持久化（`load-amdgpu.service` → `/root/load_amdgpu.sh`）
+- **磁盘镜像**：`cosim-gpu-setup.service` 开机自动加载驱动（dd ROM → modprobe `ip_block_mask=0x67 discovery=2 ras_enable=0`）
 
 ### 已知限制
 
 1. **Fence 回退定时器**：驱动初始化期间出现 80 多次 DRM fence 超时（每次约 500 ms）。ring 测试通过 DRM 回退定时器"通过"。驱动加载完成后，MSI 中断可正常用于计算分发。
 
-2. **无 VGA BIOS ROM**：`Unable to locate a BIOS ROM` 警告。计算场景不需要；可跳过 VGA ROM dd 步骤。
+2. **VGA BIOS ROM 必须先 dd**：`dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128` 必须在 `modprobe` 之前执行。驱动的 BIOS 发现链（ACPI ATRM/VFCT、SMU ROM 读取、Platform ROM）在 cosim 模式下全部失败。如果 `0xC0000` 处没有 ROM 数据，`atom_context` 为 NULL，`amdgpu_ras_init` 会触发空指针崩溃。
 
 3. **GART 未映射页**：部分 GART 页的 PTE=0，路由到 sink。这是安全的，但意味着 DMA 到这些地址时读取到零。
 
@@ -255,13 +255,12 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
 
 ### 快速启动
 ```bash
-cd cosim/gem5
-bash scripts/cosim_launch.sh
-# Guest 启动后（以 root 自动登录）：
-ln -sf /usr/lib/firmware/amdgpu/mi300_discovery \
-       /usr/lib/firmware/amdgpu/ip_discovery.bin
-modprobe amdgpu ip_block_mask=0x67 discovery=2
-rocm-smi   # 验证 GPU 是否可见
+cd cosim
+./scripts/cosim_launch.sh
+# GPU 驱动通过 cosim-gpu-setup.service 自动加载（约 40 秒）
+# Guest 启动后验证：
+rocm-smi   # 应显示设备 0x74a0
+rocminfo   # 应显示 gfx942
 ```
 
 ### 手动启动（用于调试）
@@ -298,8 +297,9 @@ screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
           shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184 \
   -nographic -no-reboot
 
-# 4. 交互操作
-screen -S qemu-cosim -X stuff 'modprobe amdgpu ip_block_mask=0x67 discovery=2\n'
+# 4. 手动 GPU 初始化（如果 cosim-gpu-setup.service 未安装）
+screen -S qemu-cosim -X stuff 'dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128\n'
+screen -S qemu-cosim -X stuff 'modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0\n'
 ```
 
 ## 6. 调试技巧
