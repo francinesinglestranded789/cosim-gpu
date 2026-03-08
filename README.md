@@ -7,20 +7,20 @@ Co-simulation framework that pairs **QEMU** (host CPU/system via KVM) with
 on a simulated GPU without physical hardware.
 
 ```
-┌─────────────────────────────┐       ┌────────────────────────────┐
-│  QEMU  (Q35 + KVM)          │       │  gem5  (Docker)            │
-│  ┌───────────────────────┐  │       │  ┌──────────────────────┐  │
-│  │ Guest Linux           │  │       │  │ MI300X GPU Model     │  │
-│  │ amdgpu driver         │  │       │  │  Shader / CU / SDMA  │  │
-│  │ ROCm 7.0 / HIP        │  │       │  │  PM4 / Ruby caches   │  │
-│  └───────────┬───────────┘  │       │  └──────────┬───────────┘  │
-│  ┌───────────▼───────────┐  │       │  ┌──────────▼───────────┐  │
-│  │ mi300x-gem5 PCIe dev  │◄────────►│  │ MI300XGem5Cosim      │  │
-│  └───────────────────────┘  │ Unix  │  └──────────────────────┘  │
-│                             │Socket │                            │
-└─────────────────────────────┘       └────────────────────────────┘
-        │                                       │
-        ▼                                       ▼
++-----------------------------+       +----------------------------+
+|  QEMU  (Q35 + KVM)          |       |  gem5  (Docker)            |
+|  +-----------------------+  |       |  +----------------------+  |
+|  | Guest Linux           |  |       |  | MI300X GPU Model     |  |
+|  | amdgpu driver         |  |       |  |  Shader / CU / SDMA  |  |
+|  | ROCm 7.0 / HIP        |  |       |  |  PM4 / Ruby caches   |  |
+|  +----------+------------+  |       |  +---------+------------+  |
+|  +----------v------------+  |       |  +---------v------------+  |
+|  | mi300x-gem5 PCIe dev  |<-------->|  | MI300XGem5Cosim      |  |
+|  +-----------------------+  | Unix  |  +----------------------+  |
+|                             |Socket |                            |
++-----------------------------+       +----------------------------+
+        |                                       |
+        v                                       v
   /dev/shm/cosim-guest-ram            /dev/shm/mi300x-vram
   (shared guest RAM)                  (shared GPU VRAM)
 ```
@@ -140,24 +140,24 @@ EOF
 
 ```
 cosim/
-├── gem5/                    # gem5 simulator (submodule, cosim-gpu branch)
-│   ├── src/dev/amdgpu/      # MI300X GPU device model & cosim bridge
-│   └── configs/example/gpufs/mi300_cosim.py  # cosim configuration
-├── qemu/                    # QEMU emulator (submodule, cosim-gpu branch)
-│   ├── hw/misc/mi300x_gem5.c      # mi300x-gem5 PCIe device
-│   └── include/hw/misc/mi300x_gem5.h
-├── gem5-resources/          # disk images, kernels, GPU apps (submodule)
-├── scripts/                 # build & launch scripts
-│   ├── cosim_launch.sh      # one-click cosim launcher
-│   ├── run_mi300x_fs.sh     # build orchestration
-│   ├── cosim_guest_setup.sh # guest-side GPU setup
-│   ├── cosim_test_client.py # socket test client
-│   └── Dockerfile.run       # gem5 runtime Docker image
-├── docs/                    # technical documentation (zh + en)
-│   ├── en/                            # English
-│   └── zh/                            # Chinese
-├── LICENSE                  # Apache 2.0
-└── README.md                # this file
+|-- gem5/                    # gem5 simulator (submodule, cosim-gpu branch)
+|   |-- src/dev/amdgpu/      # MI300X GPU device model & cosim bridge
+|   `-- configs/example/gpufs/mi300_cosim.py  # cosim configuration
+|-- qemu/                    # QEMU emulator (submodule, cosim-gpu branch)
+|   |-- hw/misc/mi300x_gem5.c      # mi300x-gem5 PCIe device
+|   `-- include/hw/misc/mi300x_gem5.h
+|-- gem5-resources/          # disk images, kernels, GPU apps (submodule)
+|-- scripts/                 # build & launch scripts
+|   |-- cosim_launch.sh      # one-click cosim launcher
+|   |-- run_mi300x_fs.sh     # build orchestration
+|   |-- cosim_guest_setup.sh # guest-side GPU setup
+|   |-- cosim_test_client.py # socket test client
+|   `-- Dockerfile.run       # gem5 runtime Docker image
+|-- docs/                    # technical documentation (zh + en)
+|   |-- en/                  # English
+|   `-- zh/                  # Chinese
+|-- LICENSE                  # Apache 2.0
+`-- README.md                # this file
 ```
 
 ## Key Components

@@ -6,20 +6,20 @@
 模型）相结合的联合仿真框架，无需物理 GPU 硬件即可运行真实的 AMD ROCm/HIP 工作负载。
 
 ```
-┌─────────────────────────────┐       ┌────────────────────────────┐
-│  QEMU  (Q35 + KVM)          │       │  gem5  (Docker)            │
-│  ┌───────────────────────┐  │       │  ┌──────────────────────┐  │
-│  │ Guest Linux           │  │       │  │ MI300X GPU Model     │  │
-│  │ amdgpu driver         │  │       │  │  Shader / CU / SDMA  │  │
-│  │ ROCm 7.0 / HIP        │  │       │  │  PM4 / Ruby caches   │  │
-│  └───────────┬───────────┘  │       │  └──────────┬───────────┘  │
-│  ┌───────────▼───────────┐  │       │  ┌──────────▼───────────┐  │
-│  │ mi300x-gem5 PCIe dev  │◄────────►│  │ MI300XGem5Cosim      │  │
-│  └───────────────────────┘  │ Unix  │  └──────────────────────┘  │
-│                             │Socket │                            │
-└─────────────────────────────┘       └────────────────────────────┘
-        │                                       │
-        ▼                                       ▼
++-----------------------------+       +----------------------------+
+|  QEMU  (Q35 + KVM)          |       |  gem5  (Docker)            |
+|  +-----------------------+  |       |  +----------------------+  |
+|  | Guest Linux           |  |       |  | MI300X GPU Model     |  |
+|  | amdgpu driver         |  |       |  |  Shader / CU / SDMA  |  |
+|  | ROCm 7.0 / HIP        |  |       |  |  PM4 / Ruby caches   |  |
+|  +----------+------------+  |       |  +---------+------------+  |
+|  +----------v------------+  |       |  +---------v------------+  |
+|  | mi300x-gem5 PCIe dev  |<-------->|  | MI300XGem5Cosim      |  |
+|  +-----------------------+  | Unix  |  +----------------------+  |
+|                             |Socket |                            |
++-----------------------------+       +----------------------------+
+        |                                       |
+        v                                       v
   /dev/shm/cosim-guest-ram            /dev/shm/mi300x-vram
   (shared guest RAM)                  (shared GPU VRAM)
 ```
@@ -139,24 +139,24 @@ EOF
 
 ```
 cosim/
-├── gem5/                    # gem5 仿真器（子模块，cosim-gpu 分支）
-│   ├── src/dev/amdgpu/      # MI300X GPU 设备模型和 cosim 桥接
-│   └── configs/example/gpufs/mi300_cosim.py  # cosim 配置
-├── qemu/                    # QEMU 模拟器（子模块，cosim-gpu 分支）
-│   ├── hw/misc/mi300x_gem5.c      # mi300x-gem5 PCIe 设备
-│   └── include/hw/misc/mi300x_gem5.h
-├── gem5-resources/          # 磁盘镜像、内核、GPU 应用（子模块）
-├── scripts/                 # 构建和启动脚本
-│   ├── cosim_launch.sh      # cosim 一键启动脚本
-│   ├── run_mi300x_fs.sh     # 编排脚本
-│   ├── cosim_guest_setup.sh # Guest 侧 GPU 设置脚本
-│   ├── cosim_test_client.py # Socket 测试客户端
-│   └── Dockerfile.run       # gem5 运行时 Docker 镜像
-├── docs/                    # 技术文档（中文 + 英文）
-│   ├── en/                            # English
-│   └── zh/                            # 中文
-├── LICENSE                  # Apache 2.0
-└── README.md                # 英文文档
+|-- gem5/                    # gem5 simulator (submodule, cosim-gpu branch)
+|   |-- src/dev/amdgpu/      # MI300X GPU device model & cosim bridge
+|   `-- configs/example/gpufs/mi300_cosim.py  # cosim configuration
+|-- qemu/                    # QEMU emulator (submodule, cosim-gpu branch)
+|   |-- hw/misc/mi300x_gem5.c      # mi300x-gem5 PCIe device
+|   `-- include/hw/misc/mi300x_gem5.h
+|-- gem5-resources/          # disk images, kernels, GPU apps (submodule)
+|-- scripts/                 # build & launch scripts
+|   |-- cosim_launch.sh      # one-click cosim launcher
+|   |-- run_mi300x_fs.sh     # build orchestration
+|   |-- cosim_guest_setup.sh # guest-side GPU setup
+|   |-- cosim_test_client.py # socket test client
+|   `-- Dockerfile.run       # gem5 runtime Docker image
+|-- docs/                    # technical documentation (zh + en)
+|   |-- en/                  # English
+|   `-- zh/                  # Chinese
+|-- LICENSE                  # Apache 2.0
+`-- README.md
 ```
 
 ## 技术文档
