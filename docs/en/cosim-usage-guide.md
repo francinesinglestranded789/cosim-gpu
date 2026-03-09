@@ -16,9 +16,9 @@ A complete workflow from compilation to running HIP GPU compute.
 │  └───────────┬───────────────┘  │     │  │ - Ruby Cache Hierarchy │  │
 │              │ MMIO/Doorbell    │     │  └──────────┬─────────────┘  │
 │  ┌───────────▼───────────────┐  │     │  ┌──────────▼─────────────┐  │
-│  │ mi300x-gem5 PCIe Device   │◄─────►│  │ MI300XGem5Cosim Bridge │  │
-│  └───────────────────────────┘  │ Unix │  └────────────────────────┘  │
-│                                 │Socket│                              │
+│  │ vfio-user-pci (built-in)  │◄─────►│  │ MI300XVfioUser Server  │  │
+│  └───────────────────────────┘  │vfio │  └────────────────────────┘  │
+│                                 │-user│                              │
 └─────────────────────────────────┘     └──────────────────────────────┘
         │                                         │
         ▼                                         ▼
@@ -28,7 +28,7 @@ A complete workflow from compilation to running HIP GPU compute.
 
 - **QEMU** is responsible for: CPU execution, Linux kernel boot, PCIe enumeration, amdgpu driver loading
 - **gem5** is responsible for: MI300X GPU compute model (Shader, CU, Cache, DMA engines)
-- They communicate via **Unix domain socket** (MMIO synchronous + Event asynchronous) and share data via **shared memory**
+- They communicate via the **vfio-user protocol** (over a Unix domain socket). QEMU uses its built-in `vfio-user-pci` device, while gem5 runs `MI300XVfioUser` as a vfio-user server, transparently handling MMIO / Doorbell / PCI Config accesses. Data is shared via **shared memory**
 
 ## Prerequisites
 
@@ -58,7 +58,7 @@ A complete workflow from compilation to running HIP GPU compute.
             disk-image/x86-ubuntu-rocm70   # 55G raw disk image
             vmlinux-rocm70                 # kernel
     docs/                              # documentation
-    qemu/                              # QEMU source (with mi300x-gem5 device)
+    qemu/                              # QEMU source (only needed for legacy backend)
         build/qemu-system-x86_64       # QEMU binary
 ```
 
@@ -67,6 +67,8 @@ A complete workflow from compilation to running HIP GPU compute.
 ## Step 1: Build gem5
 
 The gem5 binary links against Ubuntu 24.04 libraries and must be compiled in a compatible environment.
+
+> **Note:** The vfio-user backend requires `libjson-c-dev` (build-time) and `libjson-c5` (runtime). The `ghcr.io/gem5/gpu-fs:latest` image already includes this dependency. If building directly on the host, install `libjson-c-dev` first.
 
 ### Option 1: Build inside Docker (Recommended)
 
@@ -104,16 +106,18 @@ This image is based on `ghcr.io/gem5/gpu-fs` with Python 3.12 support added, use
 
 ## Step 2: Build QEMU
 
-QEMU needs the source code containing the `mi300x-gem5` device (cosim branch).
+With the vfio-user backend, a **stock QEMU 10.0+** build works out of the box (the `vfio-user-pci` device is built-in) -- no custom QEMU code is needed. Standard build:
 
 ```bash
-cd /home/zevorn/cosim/qemu
-mkdir -p build && cd build
-../configure --target-list=x86_64-softmmu
+# Any QEMU 10.0+ source tree works
+mkdir -p qemu-build && cd qemu-build
+/path/to/qemu/configure --target-list=x86_64-softmmu
 make -j$(nproc)
 ```
 
-Output: `build/qemu-system-x86_64`.
+Output: `qemu-system-x86_64`.
+
+> **Legacy backend:** If using `--cosim-backend=legacy`, the `cosim/qemu/` source containing the `mi300x-gem5` device is required. The build procedure is the same, but you must use the cosim branch QEMU source.
 
 Alternatively, via the orchestration script:
 
@@ -170,6 +174,8 @@ Available options:
 ./scripts/cosim_launch.sh --gem5-debug MI300XCosim   # enable gem5 debug output
 ./scripts/cosim_launch.sh --vram-size 32GiB          # custom VRAM size
 ./scripts/cosim_launch.sh --num-cus 80               # custom CU count
+./scripts/cosim_launch.sh --cosim-backend=vfio-user  # use vfio-user backend (default)
+./scripts/cosim_launch.sh --cosim-backend=legacy     # use legacy custom socket backend
 ```
 
 ### Option 2: Manual Step-by-step Launch
@@ -228,8 +234,8 @@ docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
 #### 4.4 Start QEMU
 
 ```bash
-# Foreground interactive mode
-/home/zevorn/cosim/qemu/build/qemu-system-x86_64 \
+# Foreground interactive mode (vfio-user backend, stock QEMU 10.0+)
+qemu-system-x86_64 \
     -machine q35 -enable-kvm -cpu host \
     -m 8G -smp 4 \
     -object memory-backend-file,id=mem0,size=8G,mem-path=/dev/shm/cosim-guest-ram,share=on \
@@ -237,17 +243,19 @@ docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
     -kernel /home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70 \
     -append "console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu" \
     -drive file=/home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
-    -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184 \
+    -device 'vfio-user-pci,socket={"type":"unix","path":"/tmp/gem5-mi300x.sock"}' \
     -nographic -no-reboot
 ```
 
 > **Important:** The kernel command line must include `modprobe.blacklist=amdgpu` to prevent the PCI subsystem from auto-loading the driver before the VGA ROM is written to shared memory. The `cosim-gpu-setup.service` handles the correct initialization order (dd ROM → modprobe).
+>
+> **Note:** With the vfio-user backend, there is no need to specify `shmem-path` or `vram-size` on the QEMU side. Shared memory is created and managed by the `MI300XVfioUser` server in gem5.
 
 Or run in background screen mode:
 
 ```bash
 screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
-    /home/zevorn/cosim/qemu/build/qemu-system-x86_64 \
+    qemu-system-x86_64 \
     -machine q35 -enable-kvm -cpu host \
     -m 8G -smp 4 \
     -object memory-backend-file,id=mem0,size=8G,mem-path=/dev/shm/cosim-guest-ram,share=on \
@@ -255,7 +263,7 @@ screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
     -kernel /home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70 \
     -append "console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu" \
     -drive file=/home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
-    -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184 \
+    -device 'vfio-user-pci,socket={"type":"unix","path":"/tmp/gem5-mi300x.sock"}' \
     -nographic -no-reboot
 
 # Attach to the screen session to view serial output
@@ -297,7 +305,7 @@ modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 > - `ip_block_mask=0x67` (binary 0110_0111) enables GMC, IH, DCN, GFX, SDMA, VCN, and disables PSP and SMU
 > - Using an incorrect mask (e.g., 0x6f) will cause PSP initialization to trigger a GPU reset, resulting in a kernel panic
 > - `ras_enable=0` is required to prevent a NULL pointer crash in `amdgpu_atom_parse_data_header` (the 3KB cosim ROM has minimal ATOMBIOS data)
-> - The `dd` step is **mandatory** — without it, the driver's BIOS discovery chain fails and `atom_context` is NULL
+> - The `dd` step is **mandatory** -- without it, the driver's BIOS discovery chain fails and `atom_context` is NULL
 
 ### Verify Driver Loading
 
@@ -491,12 +499,13 @@ error: cannot find ROCm device library
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--socket-path` | `/tmp/gem5-mi300x.sock` | QEMU <-> gem5 communication socket |
+| `--socket-path` | `/tmp/gem5-mi300x.sock` | QEMU <-> gem5 communication socket (vfio-user protocol) |
 | `--shmem-path` | `/mi300x-vram` | GPU VRAM shared memory name (under /dev/shm) |
 | `--shmem-host-path` | `/cosim-guest-ram` | Guest RAM shared memory name |
 | `--dgpu-mem-size` | `16GiB` | GPU VRAM size |
 | `--num-compute-units` | `40` | Number of GPU compute units |
 | `--mem-size` | `8GiB` | Guest physical memory size |
+| `--cosim-backend` | `vfio-user` | Cosim backend type (`vfio-user` or `legacy`) |
 | `ip_block_mask` | `0x67` | amdgpu driver IP block mask |
 | `discovery` | `2` | Use IP discovery firmware |
 
@@ -507,10 +516,11 @@ error: cannot find ROCm device library
 | `scripts/cosim_launch.sh` | cosim one-click launch script |
 | `scripts/run_mi300x_fs.sh` | Orchestration script (compile, build image, run) |
 | `configs/example/gpufs/mi300_cosim.py` | gem5 cosim configuration |
-| `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | gem5-side cosim bridge |
+| `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | gem5-side vfio-user server (default backend) |
+| `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | gem5-side legacy bridge (legacy backend) |
 | `src/dev/amdgpu/amdgpu_device.cc` | GPU device model |
 | `src/dev/amdgpu/amdgpu_vm.cc` | GPU address translation (GART, etc.) |
-| `qemu/hw/misc/mi300x_gem5.c` | QEMU-side mi300x-gem5 PCIe device |
+| `qemu/hw/misc/mi300x_gem5.c` | QEMU-side mi300x-gem5 PCIe device (legacy backend only) |
 
 ## Version Matrix
 
@@ -523,3 +533,4 @@ error: cannot find ROCm device library
 | gem5 Build Target | VEGA_X86 |
 | GPU Device | MI300X (gfx942, DeviceID 0x74A0) |
 | Coherence Protocol | GPU_VIPER |
+| QEMU | 10.0+ (vfio-user backend) or cosim branch (legacy backend) |

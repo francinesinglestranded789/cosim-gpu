@@ -16,19 +16,19 @@
 │  └──────────┬───────────────┘   │
 │             │ MMIO / Doorbell    │
 │  ┌──────────▼───────────────┐   │
-│  │  mi300x-gem5 PCI device  │   │
-│  │  (qemu/hw/misc/          │   │
-│  │   mi300x_gem5.c)         │   │
+│  │  vfio-user-pci           │   │
+│  │  (QEMU built-in device)  │   │
 │  └──────────┬───────────────┘   │
-│             │ Unix socket        │
+│             │ vfio-user protocol │
 └─────────────┼───────────────────┘
               │  /tmp/gem5-mi300x.sock
-              │  (MMIO conn + Event conn)
+              │  (Unix socket)
 ┌─────────────┼───────────────────┐
 │  gem5       │                   │
 │  ┌──────────▼───────────────┐   │
-│  │  MI300XGem5Cosim bridge  │   │
-│  │  (mi300x_gem5_cosim.cc)  │   │
+│  │  MI300XVfioUser          │   │
+│  │  (mi300x_vfio_user.cc)   │   │
+│  │  [libvfio-user server]   │   │
 │  └──────────┬───────────────┘   │
 │             │ AMDGPUDevice API   │
 │  ┌──────────▼───────────────┐   │
@@ -44,13 +44,18 @@ Shared Memory:
   /dev/shm/mi300x-vram       GPU VRAM (QEMU BAR0 ↔ gem5 device memory)
 ```
 
+> **注意**：旧版后端（`mi300x-gem5` QEMU 设备 + `MI300XGem5Cosim` gem5 桥接）仍然可用，可通过 `--cosim-backend=legacy` 选择。vfio-user 后端是当前默认选项。
+
 ### 关键组件
 
 | 组件 | 位置 | 作用 |
 |---|---|---|
-| `mi300x_gem5.c` | `qemu/hw/misc/` | QEMU PCI 设备；通过 socket 将 MMIO/doorbell 转发到 gem5 |
-| `MI300XGem5Cosim` | `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | gem5 SimObject；接受 socket 连接，分发到 AMDGPUDevice |
-| `mi300_cosim.py` | `configs/example/gpufs/` | gem5 配置；最小化的 System()，包含 GPU 层次结构，无 kernel |
+| `MI300XVfioUser` | `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | gem5 vfio-user 服务端；通过 libvfio-user 处理 BAR 访问和中断（**默认后端**） |
+| `vfio-user-pci` | QEMU 内建设备 | QEMU 侧 vfio-user 客户端；无需自定义 QEMU 代码 |
+| `CosimBridge` | `src/dev/amdgpu/cosim_bridge.hh` | 抽象协同仿真桥接接口，vfio-user 和 legacy 后端均实现此接口 |
+| `MI300XGem5Cosim` | `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | 旧版 socket 桥接 SimObject（**legacy 后端**） |
+| `mi300x_gem5.c` | `qemu/hw/misc/`（legacy） | 旧版 QEMU PCI 设备；通过自定义 socket 协议转发 MMIO/doorbell（**legacy 后端**） |
+| `mi300_cosim.py` | `configs/example/gpufs/` | gem5 配置；通过 `--cosim-backend=vfio-user\|legacy` 选择后端 |
 | `cosim_launch.sh` | `scripts/` | 编排 Docker (gem5) + QEMU 的启动流程 |
 
 ### PCI BAR 布局
@@ -87,7 +92,7 @@ above_4g = total_mem - below_4g
 
 **关键教训**：当两个系统共享 memory-backend-file 时，它们必须在每个范围的文件偏移量上达成一致，而不仅仅是总大小。
 
-### 2.2 SIGIO 边沿触发排空问题（严重）
+### 2.2 SIGIO 边沿触发排空问题（严重，legacy 后端）
 
 **现象**：gem5 处理完第一条 MMIO 消息后永远挂起。QEMU 的 socket 缓冲区被填满。
 
@@ -102,6 +107,8 @@ do {
     struct pollfd pfd = {fd, POLLIN, 0};
 } while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN));
 ```
+
+> **注意**：此问题仅影响 legacy 后端。vfio-user 后端使用 libvfio-user 的非阻塞 poll 机制，不依赖 SIGIO 信号。
 
 ### 2.3 VRAM 地址 GART 翻译错误（严重）
 
@@ -182,10 +189,19 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
 
 **关键发现**：共享 VRAM 中 `gartBase`（= `ptBase`）处的 GART PTE 已被驱动正确填充。诊断信息确认后续的 PTE（偏移 0x32E0+）包含有效条目，而第一页（ptStart 本身）只是未映射——这是正常现象。
 
+### 2.11 SDMA Ring 测试超时
+
+**现象**：驱动初始化期间，SDMA ring 测试返回 -110（ETIMEDOUT）。
+
+**根因**：`sdma_engine.hh` 中 `sdma_delay = 1e9` 导致每次 SDMA 处理步骤消耗 10 亿仿真 tick。结合 keepalive 驱动的事件循环，SDMA 完成的实际墙钟时间约 500ms，超过了驱动端约 200ms 的超时限制。
+
+**修复**：将 `sdma_delay` 从 `1e9` 降低到 `1000`，同时将 `KEEPALIVE_INTERVAL` 增加到 `1e9`。这大幅缩短了 SDMA 操作的墙钟延迟，使 ring 测试能在驱动超时窗口内完成。
+
 ## 3. 当前状态
 
 ### 已实现的功能
 
+- **vfio-user 后端（默认）**：QEMU 使用内建 `vfio-user-pci` 设备，gem5 运行 `MI300XVfioUser` 作为 vfio-user 服务端。无需自定义 QEMU 代码，原生 QEMU 10.0+ 即可使用
 - **驱动初始化**：amdgpu 3.64.0 完整加载
   - 从固件文件进行 IP discovery（`discovery=2`）
   - GMC（内存控制器）、GFX（计算）、SDMA、IH（中断处理器）
@@ -193,6 +209,8 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
   - 4 个 SDMA 引擎 × 4 队列 = 16 个 SDMA ring
   - 跨 8 个 XCP 分区的 64 个以上 compute ring
   - 7 个 DRM XCP 设备节点（`/dev/dri/renderD129..135`）
+  - SDMA ring 测试通过（`sdma_delay` 调优后正常完成）
+  - Fence 回退定时器问题已解决
 - **ROCm 工具**：
   - `rocm-smi`：设备 0x74a0，SPX 分区，1% VRAM
   - `rocminfo`：Agent gfx942，320 CU，4 SIMD/CU，KERNEL_DISPATCH
@@ -202,29 +220,40 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
   - Kernel dispatch（`addKernel<<<1, N>>>`）运行在 gfx942 上
   - `hipDeviceSynchronize` 返回 `hipSuccess`
   - 结果验证正确：`{1+10, 2+20, 3+30, 4+40}` = `{11, 22, 33, 44}`
-- **MSI-X 中断转发**：gem5 → QEMU 通过 event socket
+  - 测试结果：vector_add (120ms)、transpose (6.5s)、gemm (4.7s) 均 PASSED
+- **MSI-X 中断转发**：gem5 → QEMU 通过 vfio-user 协议（vfio-user 后端）或 event socket（legacy 后端）
   - `AMDGPUDevice::intrPost()` → `cosimBridge->sendIrqRaise(0)`
-  - QEMU event 线程 → `msix_notify()` → guest IH 处理程序
+  - QEMU → guest IH 处理程序
 - **GART 翻译**：协同仿真兜底机制从共享 VRAM 读取 PTE；未映射页安全路由到 sink
 - **65,000+ 次 MMIO 操作**处理无崩溃
 - **磁盘镜像**：`cosim-gpu-setup.service` 开机自动加载驱动（dd ROM → modprobe `ip_block_mask=0x67 discovery=2 ras_enable=0`）
 
 ### 已知限制
 
-1. **Fence 回退定时器**：驱动初始化期间出现 80 多次 DRM fence 超时（每次约 500 ms）。ring 测试通过 DRM 回退定时器"通过"。驱动加载完成后，MSI 中断可正常用于计算分发。
+1. **VGA BIOS ROM 必须先 dd**：`dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128` 必须在 `modprobe` 之前执行。驱动的 BIOS 发现链（ACPI ATRM/VFCT、SMU ROM 读取、Platform ROM）在 cosim 模式下全部失败。如果 `0xC0000` 处没有 ROM 数据，`atom_context` 为 NULL，`amdgpu_ras_init` 会触发空指针崩溃。
 
-2. **VGA BIOS ROM 必须先 dd**：`dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128` 必须在 `modprobe` 之前执行。驱动的 BIOS 发现链（ACPI ATRM/VFCT、SMU ROM 读取、Platform ROM）在 cosim 模式下全部失败。如果 `0xC0000` 处没有 ROM 数据，`atom_context` 为 NULL，`amdgpu_ras_init` 会触发空指针崩溃。
-
-3. **GART 未映射页**：部分 GART 页的 PTE=0，路由到 sink。这是安全的，但意味着 DMA 到这些地址时读取到零。
+2. **GART 未映射页**：部分 GART 页的 PTE=0，路由到 sink。这是安全的，但意味着 DMA 到这些地址时读取到零。
 
 ## 4. 文件变更总结
 
-### gem5（新文件）
+### gem5（新文件 - vfio-user 后端）
+| 文件 | 说明 |
+|---|---|
+| `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | vfio-user 服务端 SimObject |
+| `src/dev/amdgpu/MI300XVfioUser.py` | SimObject Python 封装 |
+| `src/dev/amdgpu/cosim_bridge.hh` | 抽象 CosimBridge 接口（vfio-user 和 legacy 后端均实现） |
+| `ext/libvfio-user/` | libvfio-user 库（子模块） |
+
+### gem5（新文件 - legacy 后端）
 | 文件 | 说明 |
 |---|---|
 | `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | Socket 桥接 SimObject |
 | `src/dev/amdgpu/MI300XGem5Cosim.py` | SimObject Python 封装 |
-| `configs/example/gpufs/mi300_cosim.py` | 协同仿真系统配置 |
+
+### gem5（新文件 - 通用）
+| 文件 | 说明 |
+|---|---|
+| `configs/example/gpufs/mi300_cosim.py` | 协同仿真系统配置（`--cosim-backend=vfio-user\|legacy`） |
 | `scripts/cosim_launch.sh` | 启动编排脚本 |
 
 ### gem5（修改的文件）
@@ -232,25 +261,27 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
 |---|---|
 | `src/dev/amdgpu/pm4_packet_processor.{cc,hh}` | VRAM 写路由、`isVRAMAddress()`、ACQUIRE_MEM/SET_RESOURCES NOP |
 | `src/dev/amdgpu/pm4_defines.hh` | 添加 `IT_ACQUIRE_MEM`、`IT_SET_RESOURCES` |
-| `src/dev/amdgpu/sdma_engine.cc` | VRAM rptr 回写路由 |
+| `src/dev/amdgpu/sdma_engine.{cc,hh}` | VRAM rptr 回写路由、`sdma_delay` 调优 |
 | `src/dev/amdgpu/amdgpu_vm.{cc,hh}` | GART 协同仿真兜底（共享 VRAM PTE 读取）、VRAM 地址 sink |
 | `src/dev/amdgpu/amdgpu_device.cc` | 协同仿真集成钩子 |
 | `src/dev/amdgpu/amdgpu_nbio.cc` | ASIC 初始化完成寄存器 |
 | `src/dev/intel_8254_timer.{cc,hh}` | `disable_timer_events` 参数 |
 | `src/dev/mc146818.{cc,hh}` | `disable_rtc_events` 参数 |
 
-### QEMU（新文件）
+### QEMU（新文件 - legacy 后端）
 | 文件 | 说明 |
 |---|---|
 | `hw/misc/mi300x_gem5.c` | 带 socket 桥接的 MI300X PCI 设备 |
 | `hw/misc/mi300x_gem5.h` | 头文件 |
 | `hw/misc/trace-events` | trace 事件定义 |
 
+> **注意**：vfio-user 后端使用 QEMU 内建的 `vfio-user-pci` 设备，不需要任何自定义 QEMU 代码。
+
 ## 5. 运行方法
 
 ### 前置条件
 - 安装 Docker 并构建 `gem5-run:local` 镜像
-- 从 `cosim/qemu/` 编译的 QEMU（包含 mi300x-gem5 设备）
+- QEMU 10.0+（原生支持 vfio-user）；legacy 后端需要从 `cosim/qemu/` 编译的 QEMU
 - 磁盘镜像 `x86-ubuntu-rocm70` + 内核 `vmlinux-rocm70`
 
 ### 快速启动
@@ -281,9 +312,9 @@ docker run -d --name gem5-cosim \
 docker exec gem5-cosim chmod 777 /tmp/gem5-mi300x.sock
 docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
 
-# 3. 在 screen 中运行 QEMU
+# 3. 在 screen 中运行 QEMU（vfio-user 后端，默认）
 screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
-  ../qemu/build/qemu-system-x86_64 \
+  qemu-system-x86_64 \
   -machine q35 -enable-kvm -cpu host -m 8G -smp 4 \
   -object memory-backend-file,id=mem0,size=8G,\
           mem-path=/dev/shm/cosim-guest-ram,share=on \
@@ -293,9 +324,13 @@ screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
            modprobe.blacklist=amdgpu earlyprintk=serial,ttyS0,115200" \
   -drive file=../gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,\
          format=raw,if=virtio \
-  -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,\
-          shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184 \
+  -device vfio-user-pci,socket=/tmp/gem5-mi300x.sock \
   -nographic -no-reboot
+
+# 使用 legacy 后端时，将上面的 -device 行替换为：
+#   -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,\
+#           shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184
+# 并使用从 cosim/qemu/ 编译的 QEMU
 
 # 4. 手动 GPU 初始化（如果 cosim-gpu-setup.service 未安装）
 screen -S qemu-cosim -X stuff 'dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128\n'

@@ -6,6 +6,8 @@
 
 ## 1. SIGIO 合并导致的死锁（handleClientData 单次读取）
 
+> **注意**：此问题仅适用于 legacy cosim 后端（MI300XGem5Cosim）。vfio-user 后端使用 libvfio-user 的非阻塞轮询机制，不使用 FASYNC/SIGIO。
+
 **现象**：驱动在首次访问 PCIe INDEX2/DATA2 寄存器对时挂起。gem5 处理约 15 条消息后停止响应。
 
 **根因**：Linux FASYNC/SIGIO 是**边沿触发**的。当 QEMU 发送一个 fire-and-forget 的 MMIO write 后紧接着一个阻塞式 MMIO read 时，两条消息可能在 gem5 的 SIGIO handler 触发前同时到达。此时系统只会投递一个信号。原始的 `handleClientData()` 每次 SIGIO 只读取一条消息，导致第二条消息永远滞留。
@@ -111,6 +113,8 @@ modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 
 **根因**：在协同仿真模式下，QEMU 的 BAR2（VRAM，16GB）由共享内存文件（`/dev/shm/mi300x-vram`）支撑。驱动对 VRAM 的写入直接进入共享文件，**完全绕过了 gem5 的 socket 协议**。gem5 的 `AMDGPUVM::gartTable` 哈希表在 `AMDGPUDevice::writeFrame()` 中填充，而该函数仅在写入通过 gem5 内存系统时才会执行。由于 VRAM 写入绕过了 gem5，`gartTable` 始终为空。
 
+> **注意**：此问题同时适用于 legacy cosim 和 vfio-user 两种后端，因为在两种架构下 VRAM 都通过共享内存文件（`/dev/shm/mi300x-vram`）传递，驱动对 VRAM 的写入始终绕过 gem5 内存系统。
+
 **修复**（`amdgpu_vm.cc` + `amdgpu_vm.hh`）：在 `GARTTranslationGen::translate()` 中添加了共享 VRAM 回退机制：
 
 1. 在 `AMDGPUVM` 中添加 `vramShmemPtr` / `vramShmemSize` 字段
@@ -133,9 +137,31 @@ addr = (((addr >> 12) << 3) << 12) | low_bits;  // page_num *= 8
 
 ---
 
+## 7. SDMA Ring Test 超时（sdma_delay 时序问题）
+
+**现象**：驱动初始化过程中 SDMA ring test 返回 `-110`（`-ETIMEDOUT`）。
+
+**根因**：gem5 中 `sdma_engine.hh` 的 `sdma_delay` 参数默认值为 `1e9` ticks。在协同仿真模式下，gem5 的模拟时钟与墙钟（wall-clock）之间的比率导致 `1e9` ticks 对应约 500ms 的实际延迟。而 amdgpu 驱动的 SDMA ring test 超时阈值约为 200ms，远小于这个延迟。
+
+具体流程：
+1. 驱动写入 SDMA ring buffer 并敲 doorbell
+2. gem5 收到 doorbell 后调度 SDMA 处理事件，延迟 `sdma_delay` ticks
+3. 由于延迟过长，驱动在 gem5 完成处理之前就已超时
+4. 驱动报告 `sdma v4_4_2: ring 0 test failed (-110)`
+
+**修复**：
+- 将 `sdma_delay` 从 `1e9` 减小到 `1000` ticks（`sdma_engine.hh`）
+- 将 cosim 的 `KEEPALIVE_INTERVAL` 增大到 `1e9`，避免 keepalive 消息干扰时序
+
+**教训**：协同仿真模式下的时序参数不能照搬独立仿真的默认值。gem5 模拟时钟和墙钟之间的比率差异会放大或缩小延迟效果。
+
+---
+
 ## 协同仿真架构通用说明
 
-### 哪些操作绕过了 socket 协议
+### 哪些操作绕过了通信协议
+
+**Legacy 后端（自定义 socket 协议）：**
 
 | 资源           | QEMU BAR | gem5 BAR | 通过 Socket？ | 通过共享内存？ |
 |----------------|----------|----------|---------------|----------------|
@@ -143,7 +169,17 @@ addr = (((addr >> 12) << 3) << 12) | low_bits;  // page_num *= 8
 | VRAM（16GB）   | BAR2     | BAR0     | **否**        | 是             |
 | Doorbells      | BAR4     | BAR2     | 是            | 否             |
 
-任何通过拦截 VRAM 写入来填充的 gem5 数据结构（如 `gartTable`、页表、ring buffer）在协同仿真模式下都**不会**被填充。这些结构需要显式的回退机制来从共享 VRAM 中读取数据。
+**vfio-user 后端（标准 vfio-user 协议）：**
+
+| 资源           | QEMU 映射方式          | gem5 侧       | 通过 vfio-user？ | 通过共享内存？ |
+|----------------|------------------------|----------------|------------------|----------------|
+| MMIO 寄存器    | vfio-user region 回调  | BAR5           | 是               | 否             |
+| VRAM（16GB）   | vfio-user DMA region   | BAR0           | **否**           | 是             |
+| Doorbells      | vfio-user region 回调  | BAR2           | 是               | 否             |
+
+> **注意**：使用 vfio-user 后端时，QEMU 使用内置的 `vfio-user-pci` 设备，无需自定义 QEMU 设备代码。QEMU 通过 vfio-user 协议映射所有 BAR：BAR0（VRAM）通过 DMA region 映射，BAR2（doorbell）和 BAR5（MMIO）通过 vfio-user region 回调处理。
+
+任何通过拦截 VRAM 写入来填充的 gem5 数据结构（如 `gartTable`、页表、ring buffer）在协同仿真模式下都**不会**被填充。这些结构需要显式的回退机制来从共享 VRAM 中读取数据。此限制同时适用于两种后端。
 
 ### 驱动加载失败后需要重启 guest
 

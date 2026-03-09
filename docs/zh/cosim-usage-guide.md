@@ -16,9 +16,9 @@
 │  └───────────┬───────────────┘  │     │  │ - Ruby 缓存层次         │  │
 │              │ MMIO/Doorbell    │     │  └──────────┬─────────────┘  │
 │  ┌───────────▼───────────────┐  │     │  ┌──────────▼─────────────┐  │
-│  │ mi300x-gem5 PCIe 设备      │◄─────►│  │ MI300XGem5Cosim 桥接   │  │
-│  └───────────────────────────┘  │ Unix │  └────────────────────────┘  │
-│                                 │Socket│                              │
+│  │ vfio-user-pci (QEMU 内置) │◄─────►│  │ MI300XVfioUser 服务端   │  │
+│  └───────────────────────────┘  │vfio │  └────────────────────────┘  │
+│                                 │-user│                              │
 └─────────────────────────────────┘     └──────────────────────────────┘
         │                                         │
         ▼                                         ▼
@@ -28,7 +28,7 @@
 
 - **QEMU** 负责：CPU 执行、Linux 内核引导、PCIe 枚举、amdgpu 驱动加载
 - **gem5** 负责：MI300X GPU 计算模型（Shader、CU、缓存、DMA 引擎）
-- 两者通过 **Unix 域套接字** 通信（MMIO 同步 + Event 异步），通过 **共享内存** 共享数据
+- 两者通过 **vfio-user 协议**（基于 Unix 域套接字）通信。QEMU 使用内置的 `vfio-user-pci` 设备，gem5 端运行 `MI300XVfioUser` 作为 vfio-user 服务端，透明处理 MMIO / Doorbell / PCI Config 访问。数据通过 **共享内存** 共享
 
 ## 前置条件
 
@@ -58,7 +58,7 @@
             disk-image/x86-ubuntu-rocm70   # 55G raw 磁盘镜像
             vmlinux-rocm70                 # 内核
     docs/                              # 文档
-    qemu/                              # QEMU 源码（含 mi300x-gem5 设备）
+    qemu/                              # QEMU 源码（仅 legacy 后端需要）
         build/qemu-system-x86_64       # QEMU 二进制
 ```
 
@@ -67,6 +67,8 @@
 ## 第一步：编译 gem5
 
 gem5 二进制链接了 Ubuntu 24.04 的库，需要在兼容环境中编译。
+
+> **注意：** vfio-user 后端依赖 `libjson-c-dev`（编译时）和 `libjson-c5`（运行时）。`ghcr.io/gem5/gpu-fs:latest` 镜像已包含此依赖，无需额外安装。若在宿主机上直接编译，请先安装 `libjson-c-dev`。
 
 ### 方式一：Docker 内编译（推荐）
 
@@ -104,16 +106,18 @@ docker build -t gem5-run:local -f Dockerfile.run .
 
 ## 第二步：编译 QEMU
 
-QEMU 需要包含 `mi300x-gem5` 设备的源码（cosim 分支）。
+使用 vfio-user 后端时，**原版 QEMU 10.0+** 即可直接使用（内置 `vfio-user-pci` 设备），无需自定义 QEMU 代码。标准编译：
 
 ```bash
-cd /home/zevorn/cosim/qemu
-mkdir -p build && cd build
-../configure --target-list=x86_64-softmmu
+# 任意 QEMU 10.0+ 源码均可
+mkdir -p qemu-build && cd qemu-build
+/path/to/qemu/configure --target-list=x86_64-softmmu
 make -j$(nproc)
 ```
 
-产出：`build/qemu-system-x86_64`。
+产出：`qemu-system-x86_64`。
+
+> **Legacy 后端：** 若使用 `--cosim-backend=legacy`，则需要 `cosim/qemu/` 中包含 `mi300x-gem5` 设备的源码。编译方式同上，但必须使用 cosim 分支的 QEMU 源码。
 
 也可通过编排脚本：
 
@@ -170,6 +174,8 @@ cd /home/zevorn/cosim/gem5
 ./scripts/cosim_launch.sh --gem5-debug MI300XCosim   # 开启 gem5 调试输出
 ./scripts/cosim_launch.sh --vram-size 32GiB          # 自定义 VRAM 大小
 ./scripts/cosim_launch.sh --num-cus 80               # 自定义 CU 数量
+./scripts/cosim_launch.sh --cosim-backend=vfio-user  # 使用 vfio-user 后端（默认）
+./scripts/cosim_launch.sh --cosim-backend=legacy     # 使用 legacy 自定义套接字后端
 ```
 
 ### 方式二：手动分步启动
@@ -228,8 +234,8 @@ docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
 #### 4.4 启动 QEMU
 
 ```bash
-# 前台交互模式
-/home/zevorn/cosim/qemu/build/qemu-system-x86_64 \
+# 前台交互模式（vfio-user 后端，使用原版 QEMU 10.0+）
+qemu-system-x86_64 \
     -machine q35 -enable-kvm -cpu host \
     -m 8G -smp 4 \
     -object memory-backend-file,id=mem0,size=8G,mem-path=/dev/shm/cosim-guest-ram,share=on \
@@ -237,17 +243,19 @@ docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
     -kernel /home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70 \
     -append "console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu" \
     -drive file=/home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
-    -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184 \
+    -device 'vfio-user-pci,socket={"type":"unix","path":"/tmp/gem5-mi300x.sock"}' \
     -nographic -no-reboot
 ```
 
 > **重要：** 内核命令行必须包含 `modprobe.blacklist=amdgpu`，防止 PCI 子系统在 VGA ROM 写入共享内存之前自动加载驱动。`cosim-gpu-setup.service` 会按正确顺序初始化（dd ROM → modprobe）。
+>
+> **注意：** 使用 vfio-user 后端时，无需在 QEMU 侧指定 `shmem-path` 或 `vram-size` 参数，共享内存由 gem5 端的 `MI300XVfioUser` 服务端负责创建和管理。
 
 或者以后台 screen 模式运行：
 
 ```bash
 screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
-    /home/zevorn/cosim/qemu/build/qemu-system-x86_64 \
+    qemu-system-x86_64 \
     -machine q35 -enable-kvm -cpu host \
     -m 8G -smp 4 \
     -object memory-backend-file,id=mem0,size=8G,mem-path=/dev/shm/cosim-guest-ram,share=on \
@@ -255,7 +263,7 @@ screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
     -kernel /home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70 \
     -append "console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu" \
     -drive file=/home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
-    -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184 \
+    -device 'vfio-user-pci,socket={"type":"unix","path":"/tmp/gem5-mi300x.sock"}' \
     -nographic -no-reboot
 
 # 连接 screen 查看串口输出
@@ -491,12 +499,13 @@ error: cannot find ROCm device library
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--socket-path` | `/tmp/gem5-mi300x.sock` | QEMU ↔ gem5 通信套接字 |
+| `--socket-path` | `/tmp/gem5-mi300x.sock` | QEMU ↔ gem5 通信套接字（vfio-user 协议） |
 | `--shmem-path` | `/mi300x-vram` | GPU VRAM 共享内存名称（/dev/shm 下） |
 | `--shmem-host-path` | `/cosim-guest-ram` | Guest RAM 共享内存名称 |
 | `--dgpu-mem-size` | `16GiB` | GPU VRAM 大小 |
 | `--num-compute-units` | `40` | GPU 计算单元数量 |
 | `--mem-size` | `8GiB` | Guest 物理内存大小 |
+| `--cosim-backend` | `vfio-user` | cosim 后端类型（`vfio-user` 或 `legacy`） |
 | `ip_block_mask` | `0x67` | amdgpu 驱动 IP 块掩码 |
 | `discovery` | `2` | 使用 IP discovery 固件 |
 
@@ -507,10 +516,11 @@ error: cannot find ROCm device library
 | `scripts/cosim_launch.sh` | cosim 一键启动脚本 |
 | `scripts/run_mi300x_fs.sh` | 编排脚本（编译、构建镜像、运行） |
 | `configs/example/gpufs/mi300_cosim.py` | gem5 cosim 配置 |
-| `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | gem5 侧 cosim 桥接 |
+| `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | gem5 侧 vfio-user 服务端（默认后端） |
+| `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | gem5 侧 legacy 桥接（legacy 后端） |
 | `src/dev/amdgpu/amdgpu_device.cc` | GPU 设备模型 |
 | `src/dev/amdgpu/amdgpu_vm.cc` | GPU 地址翻译（GART 等） |
-| `qemu/hw/misc/mi300x_gem5.c` | QEMU 侧 mi300x-gem5 PCIe 设备 |
+| `qemu/hw/misc/mi300x_gem5.c` | QEMU 侧 mi300x-gem5 PCIe 设备（仅 legacy 后端） |
 
 ## 版本矩阵
 
@@ -523,3 +533,4 @@ error: cannot find ROCm device library
 | gem5 构建目标 | VEGA_X86 |
 | GPU 设备 | MI300X (gfx942, DeviceID 0x74A0) |
 | 一致性协议 | GPU_VIPER |
+| QEMU | 10.0+（vfio-user 后端）或 cosim 分支（legacy 后端） |

@@ -6,6 +6,8 @@ This document records bugs encountered and fixed during the QEMU+gem5 MI300X co-
 
 ## 1. SIGIO Coalescing Deadlock (handleClientData Single Read)
 
+> **Note**: This issue is specific to the legacy cosim backend (MI300XGem5Cosim). The vfio-user backend uses libvfio-user's non-blocking poll mechanism and does not use FASYNC/SIGIO.
+
 **Symptom**: The driver hangs on its first access to the PCIe INDEX2/DATA2 register pair. gem5 stops responding after processing approximately 15 messages.
 
 **Root Cause**: Linux FASYNC/SIGIO is **edge-triggered**. When QEMU sends a fire-and-forget MMIO write immediately followed by a blocking MMIO read, both messages may arrive before gem5's SIGIO handler fires. In this case, only one signal is delivered. The original `handleClientData()` read only one message per SIGIO, leaving the second message stranded forever.
@@ -83,7 +85,7 @@ modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
 
 The ROM data at `0xC0000` is accessible by gem5 via `/dev/shm/cosim-guest-ram`. When the driver reads the ROM via SMU MMIO registers, gem5's `AMDGPUDevice::readROM()` reads from `system->getPhysMem()` at `VGA_ROM_DEFAULT + offset` and returns the ROM content through the cosim socket.
 
-**Pitfall**: QEMU's `romfile=` property loads the ROM into the PCI expansion ROM BAR, but the amdgpu driver does **not** read from the PCI ROM BAR directly — it uses SMU register-based ROM access. The `romfile` alone is insufficient; the `dd` step is always required.
+**Pitfall**: QEMU's `romfile=` property loads the ROM into the PCI expansion ROM BAR, but the amdgpu driver does **not** read from the PCI ROM BAR directly -- it uses SMU register-based ROM access. The `romfile` alone is insufficient; the `dd` step is always required.
 
 ---
 
@@ -111,6 +113,8 @@ The ROM data at `0xC0000` is accessible by gem5 via `/dev/shm/cosim-guest-ram`. 
 
 **Root Cause**: In co-simulation mode, QEMU's BAR2 (VRAM, 16GB) is backed by a shared memory file (`/dev/shm/mi300x-vram`). Driver writes to VRAM go directly into the shared file, **completely bypassing gem5's socket protocol**. gem5's `AMDGPUVM::gartTable` hash table is populated in `AMDGPUDevice::writeFrame()`, which only executes when writes go through gem5's memory system. Since VRAM writes bypass gem5, `gartTable` remains empty.
 
+> **Note**: This issue applies to both the legacy cosim and vfio-user backends, because in both architectures VRAM is passed through a shared memory file (`/dev/shm/mi300x-vram`), and driver writes to VRAM always bypass the gem5 memory system.
+
 **Fix** (`amdgpu_vm.cc` + `amdgpu_vm.hh`): Added a shared VRAM fallback in `GARTTranslationGen::translate()`:
 
 1. Added `vramShmemPtr` / `vramShmemSize` fields to `AMDGPUVM`
@@ -133,9 +137,31 @@ Therefore `bits(vaddr, 63, 12)` in the translate function is already the PTE's *
 
 ---
 
+## 7. SDMA Ring Test Timeout (sdma_delay Timing Issue)
+
+**Symptom**: SDMA ring test returns `-110` (`-ETIMEDOUT`) during driver initialization.
+
+**Root Cause**: The `sdma_delay` parameter in gem5's `sdma_engine.hh` defaults to `1e9` ticks. In co-simulation mode, the ratio between gem5's simulation clock and wall-clock time causes `1e9` ticks to correspond to approximately 500ms of real delay. The amdgpu driver's SDMA ring test timeout threshold is approximately 200ms, far shorter than this delay.
+
+Detailed flow:
+1. The driver writes to the SDMA ring buffer and rings the doorbell
+2. gem5 receives the doorbell and schedules the SDMA processing event with a delay of `sdma_delay` ticks
+3. Due to the excessive delay, the driver times out before gem5 completes processing
+4. The driver reports `sdma v4_4_2: ring 0 test failed (-110)`
+
+**Fix**:
+- Reduced `sdma_delay` from `1e9` to `1000` ticks (`sdma_engine.hh`)
+- Increased the cosim `KEEPALIVE_INTERVAL` to `1e9` to prevent keepalive messages from interfering with timing
+
+**Lesson**: Timing parameters in co-simulation mode cannot be directly reused from standalone simulation defaults. The ratio difference between gem5's simulation clock and wall-clock time amplifies or reduces delay effects.
+
+---
+
 ## General Notes on Co-simulation Architecture
 
-### Operations That Bypass the Socket Protocol
+### Operations That Bypass the Communication Protocol
+
+**Legacy backend (custom socket protocol):**
 
 | Resource         | QEMU BAR | gem5 BAR | Via Socket? | Via Shared Memory? |
 |------------------|----------|----------|-------------|--------------------|
@@ -143,7 +169,17 @@ Therefore `bits(vaddr, 63, 12)` in the translate function is already the PTE's *
 | VRAM (16GB)      | BAR2     | BAR0     | **No**      | Yes                |
 | Doorbells        | BAR4     | BAR2     | Yes         | No                 |
 
-Any gem5 data structure populated by intercepting VRAM writes (such as `gartTable`, page tables, ring buffers) will **not** be populated in co-simulation mode. These structures require explicit fallback mechanisms to read data from the shared VRAM.
+**vfio-user backend (standard vfio-user protocol):**
+
+| Resource         | QEMU Mapping Method       | gem5 Side      | Via vfio-user? | Via Shared Memory? |
+|------------------|---------------------------|----------------|----------------|--------------------|
+| MMIO Registers   | vfio-user region callback | BAR5           | Yes            | No                 |
+| VRAM (16GB)      | vfio-user DMA region      | BAR0           | **No**         | Yes                |
+| Doorbells        | vfio-user region callback | BAR2           | Yes            | No                 |
+
+> **Note**: With the vfio-user backend, QEMU uses its built-in `vfio-user-pci` device. No custom QEMU device code is needed. QEMU maps all BARs through the vfio-user protocol: BAR0 (VRAM) is mapped via DMA region, BAR2 (doorbell) and BAR5 (MMIO) use vfio-user region callbacks.
+
+Any gem5 data structure populated by intercepting VRAM writes (such as `gartTable`, page tables, ring buffers) will **not** be populated in co-simulation mode. These structures require explicit fallback mechanisms to read data from the shared VRAM. This limitation applies to both backends.
 
 ### Guest Must Be Rebooted After Driver Load Failure
 

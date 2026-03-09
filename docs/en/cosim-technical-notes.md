@@ -16,19 +16,19 @@ This document summarizes the architecture, implementation details, resolved issu
 │  └──────────┬───────────────┘   │
 │             │ MMIO / Doorbell    │
 │  ┌──────────▼───────────────┐   │
-│  │  mi300x-gem5 PCI device  │   │
-│  │  (qemu/hw/misc/          │   │
-│  │   mi300x_gem5.c)         │   │
+│  │  vfio-user-pci           │   │
+│  │  (QEMU built-in device)  │   │
 │  └──────────┬───────────────┘   │
-│             │ Unix socket        │
+│             │ vfio-user protocol │
 └─────────────┼───────────────────┘
               │  /tmp/gem5-mi300x.sock
-              │  (MMIO conn + Event conn)
+              │  (Unix socket)
 ┌─────────────┼───────────────────┐
 │  gem5       │                   │
 │  ┌──────────▼───────────────┐   │
-│  │  MI300XGem5Cosim bridge  │   │
-│  │  (mi300x_gem5_cosim.cc)  │   │
+│  │  MI300XVfioUser          │   │
+│  │  (mi300x_vfio_user.cc)   │   │
+│  │  [libvfio-user server]   │   │
 │  └──────────┬───────────────┘   │
 │             │ AMDGPUDevice API   │
 │  ┌──────────▼───────────────┐   │
@@ -44,13 +44,18 @@ Shared Memory:
   /dev/shm/mi300x-vram       GPU VRAM (QEMU BAR0 ↔ gem5 device memory)
 ```
 
+> **Note**: The legacy backend (`mi300x-gem5` QEMU device + `MI300XGem5Cosim` gem5 bridge) is still available via `--cosim-backend=legacy`. The vfio-user backend is the current default.
+
 ### Key Components
 
 | Component | Location | Purpose |
 |---|---|---|
-| `mi300x_gem5.c` | `qemu/hw/misc/` | QEMU PCI device; forwards MMIO/doorbell to gem5 via socket |
-| `MI300XGem5Cosim` | `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | gem5 SimObject; accepts socket connections, dispatches to AMDGPUDevice |
-| `mi300_cosim.py` | `configs/example/gpufs/` | gem5 config; minimal System() with GPU hierarchy, no kernel |
+| `MI300XVfioUser` | `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | gem5 vfio-user server; handles BAR access and interrupts via libvfio-user (**default backend**) |
+| `vfio-user-pci` | QEMU built-in device | QEMU-side vfio-user client; no custom QEMU code needed |
+| `CosimBridge` | `src/dev/amdgpu/cosim_bridge.hh` | Abstract co-simulation bridge interface, implemented by both vfio-user and legacy backends |
+| `MI300XGem5Cosim` | `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | Legacy socket bridge SimObject (**legacy backend**) |
+| `mi300x_gem5.c` | `qemu/hw/misc/` (legacy) | Legacy QEMU PCI device; forwards MMIO/doorbell via custom socket protocol (**legacy backend**) |
+| `mi300_cosim.py` | `configs/example/gpufs/` | gem5 config; select backend via `--cosim-backend=vfio-user\|legacy` |
 | `cosim_launch.sh` | `scripts/` | Orchestrates Docker (gem5) + QEMU launch sequence |
 
 ### PCI BAR Layout
@@ -87,7 +92,7 @@ above_4g = total_mem - below_4g
 
 **Key lesson**: When two systems share a memory-backend-file, they must agree on file offsets for each range, not just the total size.
 
-### 2.2 SIGIO Edge-Triggered Drain Issue (Critical)
+### 2.2 SIGIO Edge-Triggered Drain Issue (Critical, Legacy Backend)
 
 **Symptom**: gem5 hangs forever after processing the first MMIO message. QEMU's socket buffer fills up.
 
@@ -102,6 +107,8 @@ do {
     struct pollfd pfd = {fd, POLLIN, 0};
 } while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN));
 ```
+
+> **Note**: This issue only affects the legacy backend. The vfio-user backend uses libvfio-user's non-blocking poll mechanism and does not rely on SIGIO signals.
 
 ### 2.3 VRAM Address GART Translation Error (Critical)
 
@@ -182,10 +189,19 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
 
 **Key finding**: GART PTEs at `gartBase` (= `ptBase`) in shared VRAM were correctly populated by the driver. Diagnostics confirmed that subsequent PTEs (offset 0x32E0+) contain valid entries, while the first page (ptStart itself) is simply unmapped -- this is normal behavior.
 
+### 2.11 SDMA Ring Test Timeout
+
+**Symptom**: SDMA ring test returns -110 (ETIMEDOUT) during driver initialization.
+
+**Root cause**: `sdma_delay = 1e9` in `sdma_engine.hh` causes each SDMA processing step to take 1 billion simulation ticks. Combined with the keepalive-driven event loop, SDMA completes in ~500ms wall-clock time, exceeding the driver's ~200ms timeout window.
+
+**Fix**: Reduced `sdma_delay` from `1e9` to `1000` and increased `KEEPALIVE_INTERVAL` to `1e9`. This dramatically shortens the wall-clock latency of SDMA operations, allowing the ring test to complete within the driver's timeout window.
+
 ## 3. Current Status
 
 ### Implemented Features
 
+- **vfio-user backend (default)**: QEMU uses its built-in `vfio-user-pci` device, gem5 runs `MI300XVfioUser` as a vfio-user server. No custom QEMU code needed; stock QEMU 10.0+ works out of the box
 - **Driver initialization**: amdgpu 3.64.0 fully loaded
   - IP discovery from firmware files (`discovery=2`)
   - GMC (memory controller), GFX (compute), SDMA, IH (interrupt handler)
@@ -193,6 +209,8 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
   - 4 SDMA engines x 4 queues = 16 SDMA rings
   - 64+ compute rings across 8 XCP partitions
   - 7 DRM XCP device nodes (`/dev/dri/renderD129..135`)
+  - SDMA ring test passes (after `sdma_delay` tuning)
+  - Fence fallback timer issue resolved
 - **ROCm tools**:
   - `rocm-smi`: device 0x74a0, SPX partition, 1% VRAM
   - `rocminfo`: Agent gfx942, 320 CU, 4 SIMD/CU, KERNEL_DISPATCH
@@ -202,29 +220,40 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
   - Kernel dispatch (`addKernel<<<1, N>>>`) runs on gfx942
   - `hipDeviceSynchronize` returns `hipSuccess`
   - Results verified correct: `{1+10, 2+20, 3+30, 4+40}` = `{11, 22, 33, 44}`
-- **MSI-X interrupt forwarding**: gem5 -> QEMU via event socket
+  - Test results: vector_add (120ms), transpose (6.5s), gemm (4.7s) all PASSED
+- **MSI-X interrupt forwarding**: gem5 -> QEMU via vfio-user protocol (vfio-user backend) or event socket (legacy backend)
   - `AMDGPUDevice::intrPost()` -> `cosimBridge->sendIrqRaise(0)`
-  - QEMU event thread -> `msix_notify()` -> guest IH handler
+  - QEMU -> guest IH handler
 - **GART translation**: co-simulation fallback reads PTEs from shared VRAM; unmapped pages safely routed to sink
 - **65,000+ MMIO operations** handled without crashes
 - **Disk image**: `cosim-gpu-setup.service` auto-loads driver at boot (dd ROM → modprobe with `ip_block_mask=0x67 discovery=2 ras_enable=0`)
 
 ### Known Limitations
 
-1. **Fence fallback timer**: 80+ DRM fence timeouts during driver initialization (~500 ms each). Ring tests "pass" via the DRM fallback timer. After driver loading completes, MSI interrupts work normally for compute dispatch.
+1. **VGA BIOS ROM must be dd'd first**: The `dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128` step is mandatory before `modprobe`. The driver's BIOS discovery chain (ACPI ATRM/VFCT, SMU ROM read, platform ROM) all fail in cosim mode. Without the ROM at `0xC0000`, `atom_context` is NULL and `amdgpu_ras_init` crashes with a NULL pointer dereference.
 
-2. **VGA BIOS ROM must be dd'd first**: The `dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128` step is mandatory before `modprobe`. The driver's BIOS discovery chain (ACPI ATRM/VFCT, SMU ROM read, platform ROM) all fail in cosim mode. Without the ROM at `0xC0000`, `atom_context` is NULL and `amdgpu_ras_init` crashes with a NULL pointer dereference.
-
-3. **GART unmapped pages**: Some GART pages have PTE=0 and are routed to sink. This is safe but means DMA reads to those addresses return zeros.
+2. **GART unmapped pages**: Some GART pages have PTE=0 and are routed to sink. This is safe but means DMA reads to those addresses return zeros.
 
 ## 4. File Change Summary
 
-### gem5 (New Files)
+### gem5 (New Files - vfio-user Backend)
+| File | Description |
+|---|---|
+| `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | vfio-user server SimObject |
+| `src/dev/amdgpu/MI300XVfioUser.py` | SimObject Python wrapper |
+| `src/dev/amdgpu/cosim_bridge.hh` | Abstract CosimBridge interface (implemented by both vfio-user and legacy backends) |
+| `ext/libvfio-user/` | libvfio-user library (submodule) |
+
+### gem5 (New Files - Legacy Backend)
 | File | Description |
 |---|---|
 | `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | Socket bridge SimObject |
 | `src/dev/amdgpu/MI300XGem5Cosim.py` | SimObject Python wrapper |
-| `configs/example/gpufs/mi300_cosim.py` | Co-simulation system config |
+
+### gem5 (New Files - Common)
+| File | Description |
+|---|---|
+| `configs/example/gpufs/mi300_cosim.py` | Co-simulation system config (`--cosim-backend=vfio-user\|legacy`) |
 | `scripts/cosim_launch.sh` | Launch orchestration script |
 
 ### gem5 (Modified Files)
@@ -232,25 +261,27 @@ scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold
 |---|---|
 | `src/dev/amdgpu/pm4_packet_processor.{cc,hh}` | VRAM write routing, `isVRAMAddress()`, ACQUIRE_MEM/SET_RESOURCES NOP |
 | `src/dev/amdgpu/pm4_defines.hh` | Added `IT_ACQUIRE_MEM`, `IT_SET_RESOURCES` |
-| `src/dev/amdgpu/sdma_engine.cc` | VRAM rptr writeback routing |
+| `src/dev/amdgpu/sdma_engine.{cc,hh}` | VRAM rptr writeback routing, `sdma_delay` tuning |
 | `src/dev/amdgpu/amdgpu_vm.{cc,hh}` | GART co-simulation fallback (shared VRAM PTE reads), VRAM address sink |
 | `src/dev/amdgpu/amdgpu_device.cc` | Co-simulation integration hooks |
 | `src/dev/amdgpu/amdgpu_nbio.cc` | ASIC initialization complete register |
 | `src/dev/intel_8254_timer.{cc,hh}` | `disable_timer_events` parameter |
 | `src/dev/mc146818.{cc,hh}` | `disable_rtc_events` parameter |
 
-### QEMU (New Files)
+### QEMU (New Files - Legacy Backend)
 | File | Description |
 |---|---|
 | `hw/misc/mi300x_gem5.c` | MI300X PCI device with socket bridge |
 | `hw/misc/mi300x_gem5.h` | Header file |
 | `hw/misc/trace-events` | Trace event definitions |
 
+> **Note**: The vfio-user backend uses QEMU's built-in `vfio-user-pci` device and requires no custom QEMU code.
+
 ## 5. How to Run
 
 ### Prerequisites
 - Docker installed with `gem5-run:local` image built
-- QEMU compiled from `cosim/qemu/` (with mi300x-gem5 device)
+- QEMU 10.0+ (native vfio-user support); legacy backend requires QEMU compiled from `cosim/qemu/`
 - Disk image `x86-ubuntu-rocm70` + kernel `vmlinux-rocm70`
 
 ### Quick Start
@@ -281,9 +312,9 @@ docker run -d --name gem5-cosim \
 docker exec gem5-cosim chmod 777 /tmp/gem5-mi300x.sock
 docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
 
-# 3. Run QEMU in screen
+# 3. Run QEMU in screen (vfio-user backend, default)
 screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
-  ../qemu/build/qemu-system-x86_64 \
+  qemu-system-x86_64 \
   -machine q35 -enable-kvm -cpu host -m 8G -smp 4 \
   -object memory-backend-file,id=mem0,size=8G,\
           mem-path=/dev/shm/cosim-guest-ram,share=on \
@@ -293,9 +324,13 @@ screen -dmS qemu-cosim -L -Logfile /tmp/qemu-cosim-screen.log \
            modprobe.blacklist=amdgpu earlyprintk=serial,ttyS0,115200" \
   -drive file=../gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,\
          format=raw,if=virtio \
-  -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,\
-          shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184 \
+  -device vfio-user-pci,socket=/tmp/gem5-mi300x.sock \
   -nographic -no-reboot
+
+# For legacy backend, replace the -device line above with:
+#   -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,\
+#           shmem-path=/dev/shm/mi300x-vram,vram-size=17179869184
+# and use QEMU compiled from cosim/qemu/
 
 # 4. Manual GPU setup (if cosim-gpu-setup.service is not installed)
 screen -S qemu-cosim -X stuff 'dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128\n'

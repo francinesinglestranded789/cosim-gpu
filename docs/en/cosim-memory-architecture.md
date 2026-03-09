@@ -14,7 +14,7 @@ Both types of memory must be shared between QEMU and gem5 — otherwise gem5 can
 ### Key Takeaway
 
 > **Both VRAM and Guest RAM (where GTT pages reside) are already shared via shared memory for bidirectional visibility.**
-> The GART page table itself lives in VRAM and is also shared. gem5 reads GART PTEs directly from shared VRAM, then issues DMA to Guest RAM through the socket protocol.
+> The GART page table itself lives in VRAM and is also shared. gem5 reads GART PTEs directly from shared VRAM, then accesses Guest RAM directly through the Ruby memory system's shared backstore for DMA operations.
 
 ## 2. Overall Architecture
 
@@ -25,18 +25,18 @@ Both types of memory must be shared between QEMU and gem5 — otherwise gem5 can
 |  Guest Linux               |                    |  MI300X GPU Model           |
 |  amdgpu driver             |                    |    Shader / CU / SDMA       |
 |                            |                    |    PM4 / IH / Ruby caches   |
-|  +--------+  +---------+   |    Unix Socket     |  +---------+  +----------+  |
-|  | BAR0   |  | BAR5    |<-----(MMIO/DMA/IRQ)------>| cosim   |  | GPU core |  |
-|  | (VRAM) |  | (MMIO)  |   |                    |  | bridge  |  |          |  |
-|  +---+----+  +---------+   |                    |  +----+----+  +----------+  |
-|      |                     |                    |       |                     |
-+------+---------------------+                    +-------+---------------------+
-       |                                                  |
-       v                                                  v
+|  +--------+  +---------+   |  vfio-user (Unix)  |  +------------+ +--------+  |
+|  | BAR0   |  | BAR5    |<---(MMIO/CFG/Doorbell)--->|MI300XVfio  | |GPU core|  |
+|  | (VRAM) |  | (MMIO)  |   |                    |  |User bridge | |        |  |
+|  +---+----+  +---------+   |                    |  +-----+------+ +--------+  |
+|      |                     |                    |        |                    |
++------+---------------------+                    +--------+--------------------+
+       |                                                   |
+       v                                                   v
   /dev/shm/mi300x-vram (16 GiB)                      mmap same file
   (VRAM: GPU data + GART page tables)              (vramShmemPtr)
-       |                                                  |
-       v                                                  v
+       |                                                   |
+       v                                                   v
   /dev/shm/cosim-guest-ram (8 GiB)                    mmap same file
   (Guest RAM: ring buffers, fences,                (system->getPhysMem())
    GTT pages, kernel/user data)
@@ -47,29 +47,18 @@ Both types of memory must be shared between QEMU and gem5 — otherwise gem5 can
 | Channel | File/Socket | Size | Purpose | Access Method |
 |---------|-------------|------|---------|---------------|
 | VRAM Shared Memory | `/dev/shm/mi300x-vram` | 16 GiB | GPU VRAM + GART page tables | mmap (zero-copy) |
-| Guest RAM Shared Memory | `/dev/shm/cosim-guest-ram` | 8 GiB | Host physical memory (GTT pages) | QEMU: mmap; gem5: DMA via socket |
-| Control Socket | `/tmp/gem5-mi300x.sock` | — | MMIO, DMA requests, interrupts | Two connections (sync + async) |
+| Guest RAM Shared Memory | `/dev/shm/cosim-guest-ram` | 8 GiB | Host physical memory (GTT pages) | QEMU: mmap; gem5: Ruby memory system direct access to shared backstore |
+| vfio-user Socket | `/tmp/gem5-mi300x.sock` | — | MMIO/config space/doorbell via vfio-user message passing; DMA via `vfu_dma_transfer()` or shared memory direct access; interrupts via irq_fd (eventfd -> KVM) | vfio-user protocol (single connection) |
 
 ## 3. VRAM Sharing (BAR0)
 
 ### 3.1 Initialization Flow
 
-**QEMU side** (`mi300x_gem5.c:mi300x_gem5_realize`):
+**QEMU side** (vfio-user backend):
 
-```c
-// Open shared memory file
-fd = open(s->shmem_path, O_RDWR | O_CREAT, 0666);  // "/dev/shm/mi300x-vram"
-ftruncate(fd, vram_size);                             // 16 GiB
+QEMU uses the built-in `vfio-user-pci` device to connect to gem5's vfio-user server. BAR0 is exposed to QEMU through the vfio-user DMA region mapping mechanism — QEMU no longer directly opens the VRAM shared memory file, but instead obtains the BAR mapping through the vfio-user protocol.
 
-// Create BAR0 memory region mapped directly to the shared file
-memory_region_init_ram_from_fd(&s->vram_bar, obj, "mi300x-vram",
-                               s->vram_size, RAM_SHARED, fd, 0, &err);
-pci_register_bar(pdev, MI300X_VRAM_BAR,
-                 PCI_BASE_ADDRESS_MEM_PREFETCH | PCI_BASE_ADDRESS_MEM_TYPE_64,
-                 &s->vram_bar);
-```
-
-**gem5 side** (`mi300x_gem5_cosim.cc:setupSharedMemory`):
+**gem5 side** (`mi300x_vfio_user.cc:setupVramShm`):
 
 ```cpp
 shmemFd = shm_open(shmemPath.c_str(), O_CREAT | O_RDWR, 0666);
@@ -147,17 +136,17 @@ system.auto_unlink_shared_backstore = True
 system.memories[0].shared_backstore = args.shmem_host_path
 ```
 
-gem5's `PhysicalMemory` uses the same POSIX shared memory file as its backing store, achieving memory sharing with QEMU.
+gem5's `PhysicalMemory` uses the same POSIX shared memory file as its backing store, achieving memory sharing with QEMU. `MI300XVfioUser` also sets `gpuDevice->getVM().vramShmemPtr` to enable the GART translator to correctly access shared VRAM.
 
 ### 4.3 Why GTT Needs No Extra Sharing Mechanism
 
 GTT pages reside in Guest RAM. Guest RAM is already shared between QEMU and gem5 via `/dev/shm/cosim-guest-ram`. Therefore:
 
 1. **Driver writes to ring buffer** -> writes to Guest RAM -> `/dev/shm/cosim-guest-ram` -> gem5 can read
-2. **gem5 writes fence** -> DMA writes to Guest RAM -> `/dev/shm/cosim-guest-ram` -> driver can read
+2. **gem5 writes fence** -> Ruby memory controller writes to Guest RAM -> `/dev/shm/cosim-guest-ram` -> driver can read
 3. **Physical addresses in GART PTEs** -> offsets within Guest RAM -> accessible by both sides
 
-**Key distinction**: VRAM is accessed via zero-copy mmap; Guest RAM DMA operations go through the socket protocol (because gem5 needs to know the exact access timing to drive simulation events).
+**vfio-user backend**: Both VRAM and Guest RAM are accessed via zero-copy mmap. gem5's SDMA/PM4 DMA operations go through the Ruby memory system which directly accesses the shared backstore memory, with no socket relay needed.
 
 ## 5. GART Translation Flow
 
@@ -175,7 +164,7 @@ amdgpu driver (guest)
   |       +- data immediately appears in shared memory
   |
   +- TLB invalidate: write VM_INVALIDATE_ENG17 register
-      +- MMIO -> socket -> gem5 -> invalidateTLBs()
+      +- MMIO -> vfio-user -> gem5 -> invalidateTLBs()
 ```
 
 ### 5.2 gem5 Reads GART PTEs
@@ -225,7 +214,7 @@ Physical address paddr
   |
   +- Within sysAddrL ~ sysAddrH range?
   |   +- YES -> Guest RAM address (GTT page)
-  |       +- Access via socket DMA protocol
+  |       +- Access via Ruby memory system (shared memory direct access)
   |
   +- Neither?
       +- Sink (paddr=0, safely discarded)
@@ -233,7 +222,41 @@ Physical address paddr
 
 ## 6. DMA Flow
 
-### 6.1 gem5 Reads from Guest RAM (ring buffers / fences)
+### 6.1 vfio-user Backend: Shared Memory Direct Access
+
+With the vfio-user backend, gem5 accesses Guest RAM directly through the Ruby memory system's shared backstore (`/dev/shm/cosim-guest-ram`), with no socket-based DMA operations needed.
+
+```
+gem5 GPU model (PM4/SDMA/IH)
+  |
+  |  Needs to read ring buffer commands / write fence values
+  |
+  v  Ruby memory system request
+  |
+  +- Address translated by GART -> Guest physical address
+  |
+  +- Ruby memory controller accesses PhysicalMemory
+  |   |
+  |   +- PhysicalMemory backed by /dev/shm/cosim-guest-ram (MAP_SHARED)
+  |       +- read/write directly hits shared memory
+  |       +- QEMU sees changes immediately (same mmap file)
+  |
+  +- Done (no socket round-trip needed)
+```
+
+**Key advantages**:
+
+- **Zero-copy**: DMA reads and writes operate directly on shared memory with no serialization/deserialization
+- **Low latency**: Eliminates the socket request-response round-trip overhead
+- **Simplified architecture**: No custom DMA protocol needed; Ruby's memory system natively supports shared backstores
+
+Interrupts are delivered via vfio-user's irq_fd mechanism (eventfd -> KVM), with no custom interrupt messages needed.
+
+### 6.2 Legacy Backend: Socket DMA Protocol
+
+> The following describes the legacy custom cosim socket backend (`MI300XGem5Cosim`), retained for reference.
+
+#### 6.2.1 gem5 Reads from Guest RAM (ring buffers / fences)
 
 ```
 gem5 GPU model (PM4/SDMA/IH)
@@ -256,7 +279,7 @@ gem5 GPU model (PM4/SDMA/IH)
   +- memcpy(dest, recvBuf, length)     // data arrives at gem5
 ```
 
-### 6.2 gem5 Writes to Guest RAM (fences / IH cookies)
+#### 6.2.2 gem5 Writes to Guest RAM (fences / IH cookies)
 
 ```
 gem5 GPU model
@@ -276,16 +299,18 @@ gem5 GPU model
   +- Done (DMA writes don't wait for response)  +- Driver can see data immediately
 ```
 
-### 6.3 Why Guest RAM DMA Uses Socket Instead of Direct mmap
+### 6.3 vfio-user vs Legacy Backend Comparison
 
-Although gem5's `system->getPhysMem()` can access shared memory directly (as `readROM()` does), most DMA operations go through the socket for the following reasons:
+| Dimension | vfio-user Backend | Legacy Socket Backend |
+|-----------|-------------------|----------------------|
+| Guest RAM DMA | Ruby memory system direct access to shared backstore | Socket request-response protocol |
+| VRAM access | mmap zero-copy (same) | mmap zero-copy (same) |
+| Interrupts | irq_fd (eventfd -> KVM) | Socket messages |
+| MMIO | vfio-user message passing | Custom socket protocol |
+| QEMU-side device | Built-in `vfio-user-pci` | Custom `mi300x_gem5.c` |
+| Address translation | gem5-internal GART translation | QEMU-side `pci_dma_read/write` |
 
-1. **Address translation**: Guest physical addresses need to go through QEMU's memory model (considering IOMMU, memory region mappings)
-2. **Event-driven simulation**: gem5 is an event-driven simulator; DMA needs to trigger proper simulation events (cache coherence, timing)
-3. **Consistency guarantees**: The socket's request-response pattern naturally provides memory barrier semantics
-4. **IOMMU compatibility**: If IOMMU is enabled in the future, QEMU needs to perform address translation on its side
-
-**Exception**: `readROM()` reads shared memory directly because ROM is read-only and accessed early in simulation, requiring no event synchronization.
+The reasons the legacy backend routed Guest RAM DMA through the socket (address translation, event-driven simulation, IOMMU compatibility, etc.) no longer apply with vfio-user: gem5's Ruby memory controllers directly access the shared backstore memory, and GART address translation is performed internally within gem5.
 
 ## 7. Sink Mechanism
 
@@ -329,29 +354,31 @@ Using a HIP kernel dispatch to illustrate the full memory interaction:
 
 2. hipMemcpy(d_a, h_a, N*sizeof(int), hipMemcpyHostToDevice)
    Driver -> constructs SDMA copy command -> writes to Guest RAM (ring buffer)
-   Driver -> writes Doorbell -> QEMU BAR2 -> socket -> gem5
-   gem5 -> DMA reads ring buffer (Guest RAM via socket)
+   Driver -> writes Doorbell -> QEMU BAR2 -> vfio-user -> gem5
+   gem5 -> reads ring buffer (Guest RAM via shared memory)
    gem5 -> parses SDMA command -> GART translates source address -> Guest RAM
-   gem5 -> DMA reads source data (Guest RAM via socket)
+   gem5 -> reads source data (Guest RAM via shared memory)
    gem5 -> writes to VRAM destination (shared memory direct write)
 
 3. kernel<<<1, N>>>(d_a, d_b, d_c, N)
    Driver -> constructs PM4 dispatch command -> writes to Guest RAM (ring buffer)
    Driver -> writes Doorbell -> gem5
-   gem5 -> DMA reads PM4 command (Guest RAM via socket)
+   gem5 -> reads PM4 command (Guest RAM via shared memory)
    gem5 -> launches shader execution
    gem5 -> shader reads/writes VRAM (shared memory direct access)
-   gem5 -> writes fence on completion (Guest RAM via socket DMA write)
-   gem5 -> sends MSI-X interrupt (socket event)
+   gem5 -> writes fence on completion (Guest RAM via Ruby memory write)
+   gem5 -> sends MSI-X interrupt (irq_fd -> KVM)
 
 4. hipDeviceSynchronize()
    Driver -> polls fence value (until Guest RAM value matches)
-   +- fence written by gem5 via DMA write
+   +- fence written by gem5 via Ruby memory write to shared backstore
 ```
 
 ## 9. Known Limitations
 
-### 9.1 DMA Buffer Size
+### 9.1 DMA Buffer Size (Legacy Backend)
+
+> This limitation only applies to the legacy socket backend. The vfio-user backend accesses shared memory directly and has no such limit.
 
 Maximum single DMA transfer is 4 MiB (`COSIM_DMA_BUF_SIZE`). Transfers exceeding this size must be chunked. In practice, the driver typically submits page-sized transfers, so this limit is rarely hit.
 
@@ -371,8 +398,8 @@ Some GART addresses in gem5 point back to VRAM itself (VRAM-to-VRAM DMA). These 
 |------|---------------------|------|
 | `gem5/src/dev/amdgpu/amdgpu_vm.cc:396-557` | `GARTTranslationGen::translate()` | Core GART translation logic |
 | `gem5/src/dev/amdgpu/amdgpu_vm.hh` | `AMDGPUSysVMContext`, `vramShmemPtr` | GART data structures |
-| `gem5/src/dev/amdgpu/mi300x_gem5_cosim.cc:139-172` | `setupSharedMemory()` | VRAM shared memory initialization |
-| `gem5/src/dev/amdgpu/mi300x_gem5_cosim.cc:808-900` | `sendDmaRead/Write()` | DMA request sending |
-| `gem5/configs/example/gpufs/mi300_cosim.py` | `shared_backstore` config | Guest RAM sharing setup |
-| `qemu/hw/misc/mi300x_gem5.c:549-602` | `mi300x_gem5_realize()` | BAR0 shared memory mapping |
-| `qemu/hw/misc/mi300x_gem5.c:233-296` | event thread DMA handler | DMA request processing |
+| `gem5/src/dev/amdgpu/mi300x_vfio_user.cc` | `setupVramShm()` | VRAM shared memory initialization (vfio-user backend) |
+| `gem5/src/dev/amdgpu/mi300x_vfio_user.hh` | `MI300XVfioUser` | vfio-user server-side bridge |
+| `gem5/src/dev/amdgpu/mi300x_gem5_cosim.cc` | `setupSharedMemory()`, `sendDmaRead/Write()` | Legacy socket backend (VRAM init + DMA) |
+| `gem5/configs/example/gpufs/mi300_cosim.py` | `shared_backstore` config, `--cosim-backend` | Guest RAM sharing setup + backend selection |
+| `gem5/src/dev/amdgpu/MI300XVfioUser.py` | SimObject definition | vfio-user backend Python binding |

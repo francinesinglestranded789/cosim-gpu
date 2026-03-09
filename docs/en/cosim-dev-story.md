@@ -31,10 +31,12 @@ Architecture: The One-Liner Version
 |  | amdgpu driver         |  |       |  |  Shader / CU / SDMA  |  |
 |  | ROCm 7.0 / HIP        |  |       |  |  PM4 / Ruby caches   |  |
 |  +----------+------------+  |       |  +---------+------------+  |
+|             |               |       |            |               |
 |  +----------v------------+  |       |  +---------v------------+  |
-|  | mi300x-gem5 PCIe dev  |<-------->|  | MI300XGem5Cosim      |  |
-|  +-----------------------+  | Unix  |  +----------------------+  |
-|                             |Socket |                            |
+|  | vfio-user-pci (built- |<-------->|  | MI300XVfioUser       |  |
+|  |  in)                  |  |vfio-  |  +----------------------+  |
+|  +-----------------------+  |user   |                            |
+|                             |socket |                            |
 +-----------------------------+       +----------------------------+
         |                                       |
         v                                       v
@@ -42,7 +44,9 @@ Architecture: The One-Liner Version
   (shared guest RAM)                  (shared GPU VRAM)
 ```
 
-On the QEMU side, there's a full Q35 virtual machine running Ubuntu 24.04 + ROCm 7.0 + amdgpu driver. I added a `mi300x-gem5` PCIe device to QEMU that forwards all MMIO reads/writes and doorbell writes to gem5 via a Unix domain socket.
+> **Backend selection**: The default is the vfio-user backend (`MI300XVfioUser`), where QEMU uses its built-in `vfio-user-pci` device with no custom QEMU code required. The legacy backend (`MI300XGem5Cosim` + custom `mi300x-gem5` QEMU device) is also supported via `--cosim-backend=legacy`.
+
+On the QEMU side, there's a full Q35 virtual machine running Ubuntu 24.04 + ROCm 7.0 + amdgpu driver. The vfio-user backend uses QEMU's built-in `vfio-user-pci` device, which forwards all MMIO reads/writes and doorbell writes to gem5 via the standard vfio-user protocol.
 
 On the gem5 side, it runs the MI300X GPU device model -- Shader, CU arrays, PM4 command processor, SDMA engines, Ruby cache hierarchy -- but **no Linux kernel**. It starts with a `StubWorkload` shell and just waits for MMIO requests from QEMU over the socket.
 
@@ -238,6 +242,7 @@ Results: What Two Days Delivered
 | Git commits | 16 (cosim main repo) |
 | MMIO operations | 65,000+ without crashes |
 | HIP compute test | PASSED |
+| vfio-user migration | Completed (Mar 9), vector_add / transpose / gemm all PASSED |
 
 The final system supports:
 
@@ -246,7 +251,29 @@ The final system supports:
 - **HIP GPU compute**: hipMalloc, kernel dispatch, hipDeviceSynchronize
 - **MSI-X interrupt forwarding**: gem5 to QEMU event notification
 - **Shared memory DMA**: zero-copy VRAM + Guest RAM
+- **vfio-user backend**: standard protocol, no custom QEMU code needed
 - **One-click launch**: `./scripts/cosim_launch.sh`
+
+---
+
+## 08.5
+vfio-user Migration: From Custom Protocol to Industry Standard
+
+After validating end-to-end feasibility with the custom socket protocol in the initial version, we migrated the QEMU-gem5 communication to the standard vfio-user protocol on March 9.
+
+vfio-user is a standard protocol for exposing PCI devices to remote processes (QEMU 10.0+ includes a built-in `vfio-user-pci` client). On the gem5 side, Nutanix's libvfio-user library serves as the server. This means:
+
+- **No custom QEMU code required**: any QEMU with vfio-user support can connect to gem5 directly
+- **Protocol standardization**: BAR mapping, configuration space, interrupts, and DMA are all defined by the vfio-user specification
+- **Simpler deployment**: no need to maintain a QEMU fork
+
+Several key issues were resolved during the migration:
+- libvfio-user's BAR size field was `uint32_t`, unable to represent 16GB VRAM → changed to `uint64_t`
+- The upper half of 64-bit BARs must return the high 32 bits of the size mask during size probing
+- PCIe Express and MSI-X capabilities must be registered before `vfu_realize_ctx()`
+- SDMA ring test timeout: `sdma_delay=1e9` caused ~500ms wall-clock delay → reduced to 1000
+
+Post-migration test results: vector_add (120ms), transpose (6.5s), gemm (4.7s) all PASSED.
 
 ---
 
@@ -305,6 +332,7 @@ But this amplifier is genuinely powerful. Two days, one person, one AI, and a $1
 - [QEMU](https://www.qemu.org/) — Open-source machine emulator and virtualizer
 - [ROCm](https://rocm.docs.amd.com/) — AMD open-source GPU computing platform
 - [AMD Instinct MI300X](https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html) — Product specifications
+- [libvfio-user](https://github.com/nutanix/libvfio-user) — vfio-user protocol server library
 
 **Development Tools**
 
