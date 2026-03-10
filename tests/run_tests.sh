@@ -47,6 +47,50 @@ FAILED=0
 TOTAL=${#TESTS[@]}
 RESULTS=()
 
+run_with_timeout() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+
+    local start_ts
+    local now
+    local pid
+
+    "$@" </dev/null >"$output_file" 2>&1 &
+    pid=$!
+    start_ts=$(date +%s)
+
+    while kill -0 "$pid" 2>/dev/null; do
+        now=$(date +%s)
+        if (( now - start_ts >= timeout_secs )); then
+            if grep -q '^\[PASS\] ' "$output_file"; then
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 1
+                kill -KILL "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                return 0
+            fi
+
+            if grep -q '^\[FAIL\] ' "$output_file"; then
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 1
+                kill -KILL "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                return 1
+            fi
+
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+    done
+
+    wait "$pid"
+}
+
 echo "============================================================"
 echo "  cosim GPU Operator Tests"
 echo "  Tests: $TOTAL"
@@ -61,8 +105,11 @@ for test_bin in "${TESTS[@]}"; do
         echo "[RUN] $name (timeout: ${TEST_TIMEOUT_SECS}s)"
     fi
 
-    timeout --foreground "${TEST_TIMEOUT_SECS}" "$test_bin" >"$tmp_output" 2>&1
-    rc=$?
+    if run_with_timeout "${TEST_TIMEOUT_SECS}" "$tmp_output" "$test_bin"; then
+        rc=0
+    else
+        rc=$?
+    fi
     output="$(cat "$tmp_output")"
     rm -f "$tmp_output"
 

@@ -7,6 +7,15 @@
 #include <cstring>
 #include <chrono>
 
+struct StreamConfig {
+    StreamConfig() {
+        setvbuf(stdout, nullptr, _IONBF, 0);
+        setvbuf(stderr, nullptr, _IONBF, 0);
+    }
+};
+
+static StreamConfig g_stream_config;
+
 // Check HIP API calls
 #define HIP_CHECK(call)                                                  \
     do {                                                                 \
