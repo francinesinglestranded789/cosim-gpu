@@ -101,8 +101,8 @@ jobs:
             fi
             sleep 1
           done
-          # Ensure socket is accessible
-          chmod 666 /tmp/gem5-mi300x.sock 2>/dev/null || true
+          # Ensure socket is accessible (created by root inside Docker)
+          sudo chmod 666 /tmp/gem5-mi300x.sock
 
       - name: Run protocol test
         run: python3 scripts/cosim_test_client.py --socket /tmp/gem5-mi300x.sock -v
